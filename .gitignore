@@ -3,3 +3,9 @@ drv
 output*
 dist
 .vscode
+
+# bench build artifacts
+bench/*/
+!bench/*/main.cu
+!bench/*/Makefile
+!bench/*/README.md
