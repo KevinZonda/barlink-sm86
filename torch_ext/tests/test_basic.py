@@ -45,7 +45,22 @@ def main():
     bl.copy_(b, a)
     got = bl.readback(b)                       # copy-engine .cpu() could hit
                                                # stale L2 on inbound writes
-    assert torch.equal(got, ref), "copy_: mismatch vs CPU reference"
+    if not torch.equal(got, ref):
+        neq = (got != ref)
+        idx = neq.nonzero().flatten()
+        print("copy_: MISMATCH: %d of %d bytes differ; first at %d, last at %d"
+              % (idx.numel(), N, idx[0].item(), idx[-1].item()))
+        o = idx[0].item()
+        print("  first mismatch window @%d:" % o)
+        print("  ref :", ref[o:o+16].tolist())
+        print("  got :", got[o:o+16].tolist())
+        # second copy to see if the mismatch pattern is deterministic
+        bl.copy_(b, a)
+        got2 = bl.readback(b)
+        same2 = torch.equal(got2, ref)
+        print("  second copy_ identical to ref:", same2)
+        print("  got == got2 (deterministic):", torch.equal(got, got2))
+        raise SystemExit(1)
     print("copy_: %d bytes identical to CPU reference  OK" % N)
 
     # 3. allreduce_ against (a + b) % 256, both sides
