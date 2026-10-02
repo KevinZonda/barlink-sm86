@@ -74,8 +74,22 @@ def main():
     y.copy_(ry.cuda(1))
     want = ((rx.to(torch.int32) + ry.to(torch.int32)) % 256).to(torch.uint8)
     bl.allreduce_(x, y)
-    assert torch.equal(x.cpu(), want), "allreduce_: side 0 mismatch"
-    assert torch.equal(y.cpu(), want), "allreduce_: side 1 mismatch"
+    gotx = bl.readback(x)      # ld.global.cv on the owning card: definitive
+    goty = bl.readback(y)
+    if not torch.equal(gotx, want):
+        idx = (gotx != want).nonzero().flatten()
+        o = idx[0].item()
+        print("allreduce_: side 0 MISMATCH: %d bytes; first @%d" % (idx.numel(), o))
+        print("  want:", want[o:o+16].tolist())
+        print("  got :", gotx[o:o+16].tolist())
+        raise SystemExit(1)
+    if not torch.equal(goty, want):
+        idx = (goty != want).nonzero().flatten()
+        o = idx[0].item()
+        print("allreduce_: side 1 MISMATCH: %d bytes; first @%d" % (idx.numel(), o))
+        print("  want:", want[o:o+16].tolist())
+        print("  got :", goty[o:o+16].tolist())
+        raise SystemExit(1)
     print("allreduce_: both sides equal (a+b) mod 256  OK")
 
     # 4. small bandwidth measurement (copy_ 0 -> 1)
