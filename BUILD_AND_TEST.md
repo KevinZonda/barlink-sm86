@@ -44,6 +44,21 @@ sudo insmod dmabuf_holder/dmabuf_holder.ko
 只需 `BarlinkPeerBar1=1` 一个 key。**绝不设** `RMForceStaticBar1`。
 验证：`nvidia-smi` 出卡、`cat /proc/driver/nvidia/params | grep -i barlink` 出 1、`/dev/dmabuf_holder` 存在。
 
+### 2b. 免 sudo 运行 bench / torch（一次性）
+
+sudo 只被两个文件权限挡住（代码本身无任何 capable() 检查）：
+`/dev/dmabuf_holder`（模块写死 0600）和
+`/sys/bus/pci/devices/*/resource1_wc`（内核写死 0600，mmap 无 CAP_SYS_RAWIO 检查）。
+装好 `udev/99-barlink.rules` 后 bench 和 torch 都用普通用户跑：
+
+```bash
+sudo cp udev/99-barlink.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=pci
+sudo chmod 666 /dev/dmabuf_holder    # 本已加载的节点立即生效，重启后由规则自动设置
+```
+
+之后 `bench/` 和 `torch_ext/tests/` 全部不需要 sudo；§2 的 insmod/rmmod 仍需要。
+
 ## 3. Bench
 
 ```bash
