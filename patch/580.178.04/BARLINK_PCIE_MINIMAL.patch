@@ -1,0 +1,170 @@
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+index af47bd2..a646e6c 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+@@ -36,6 +36,8 @@
+ #include <gpu_mgr/gpu_mgr.h>
+ 
+ #include "gpu/bif/kernel_bif.h"
++#include "gpu/bus/kern_bus.h"     // BARLINK_PCIE: GPU_GET_KERNEL_BUS, kbusGetPciBarOffset/Size
++#include <nvrm_registry.h>        // BARLINK_PCIE: NV_REG_STR_BARLINK_PEER_BAR1
+ 
+ static NV_STATUS osCreateOsDescriptorFromPageArray(OBJGPU *, NvP64, NvHandle, NvU32, NvU64 *, MEMORY_DESCRIPTOR **, void **);
+ static void osDestroyOsDescriptorPageArray(PMEMORY_DESCRIPTOR);
+@@ -52,7 +54,7 @@ static void osDestroyOsDescriptorFromDmaBuf(PMEMORY_DESCRIPTOR);
+ static NV_STATUS osCreateOsDescriptorFromSgtPtr(OBJGPU *, NvP64, NvHandle, NvU32, NvU64 *, MEMORY_DESCRIPTOR **, void**);
+ static void osDestroyOsDescriptorFromSgt(PMEMORY_DESCRIPTOR);
+ 
+-static NV_STATUS osCheckGpuBarsOverlapAddrRange(NvRangeU64 addrRange);
++static NV_STATUS osCheckGpuBarsOverlapAddrRange(OBJGPU *pRequestingGpu, NvRangeU64 addrRange);
+ 
+ NV_STATUS
+ osCreateMemFromOsDescriptor
+@@ -362,6 +364,7 @@ osCreateOsDescriptorFromPageArray
+ static NV_STATUS
+ osCheckGpuBarsOverlapAddrRange
+ (
++    OBJGPU    *pRequestingGpu,
+     NvRangeU64 addrRange
+ )
+ {
+@@ -372,10 +375,97 @@ osCheckGpuBarsOverlapAddrRange
+     OBJGPU *pGpu;
+     NvU32 gpuMask;
+     NV_STATUS rmStatus;
++    NvU32 peerBar1Allowed = NV_REG_STR_BARLINK_PEER_BAR1_DISABLE;
+ 
+     rmStatus = gpumgrGetGpuAttachInfo(NULL, &gpuMask);
+     NV_ASSERT_OR_RETURN(rmStatus == NV_OK, rmStatus);
+ 
++    //
++    // BARLINK_PCIE: opt-in relaxation of this guard, for the dma-buf path.
++    //
++    // The usermode path is cuMemHostRegister(CU_MEMHOSTREGISTER_IOMEMORY) on
++    // a mapping of ANOTHER GPU's resource1_wc (its BAR1 aperture). That lands
++    // in osCreateOsDescriptorFromIoMemory() -> here, and the unchanged guard
++    // below rejects it because the peer BAR1 bus address range starts at
++    // gpumgrGetGpuPhysFbAddr(peer) and therefore overlaps the peer's FB range.
++    //
++    // The exporting GPU maps the exported buffer into BAR1 on demand
++    // (rm_dma_buf_map_mem_handle -> kbusMapFbAperture_HAL,
++    // arch/nvalloc/unix/src/osapi.c:5819; the returned bus address is
++    // kbusGetGpuFbPhysAddressForRdma() + BAR1 offset), so the address is
++    // somewhere in the peer's BAR1 aperture and not in any fixed window.
++    //
++    // Kept as tight as the mechanism allows:
++    //   - opt-in, BarlinkPeerBar1=1; without it nothing changes at all,
++    //   - only a DIFFERENT GPU, never the requesting one,
++    //   - full containment, no partial overlap,
++    //   - BAR1 only; BAR0 and BAR2 keep falling through to the deny checks.
++    //
++    // Bounds come from the PCI BARs (kbusGetPciBarOffset/Size, BUS_BAR_1) --
++    // the same aperture the client mmaps as resource1_wc -- and not from
++    // fbLength, which on a small BAR GPU is much larger than BAR1.
++    //
++    // Residual risk, stated plainly: the guard exists because of the
++    // full-duplex P2P over BAR1 deadlock in bug 1571948 (see the comment at
++    // the call site in osCreateOsDescriptorFromIoMemory). This relaxation
++    // exposes the peer's whole BAR1 aperture, which also contains the P2P
++    // write mailbox region and RM's own dynamic mappings.
++    //
++    // The current key is read first; the pre-rename key is read only when
++    // the current one is absent, so a driver that is already loaded on a rig
++    // and configured with the old name keeps working unchanged.
++    if (osReadRegistryDword(pRequestingGpu, NV_REG_STR_BARLINK_PEER_BAR1,
++                            &peerBar1Allowed) != NV_OK &&
++        osReadRegistryDword(pRequestingGpu, NV_REG_STR_BARLINK_PEER_BAR1_LEGACY,
++                            &peerBar1Allowed) != NV_OK)
++    {
++        peerBar1Allowed = NV_REG_STR_BARLINK_PEER_BAR1_DISABLE;
++    }
++
++    if (peerBar1Allowed == NV_REG_STR_BARLINK_PEER_BAR1_ENABLE)
++    {
++        gpuInstance = 0;
++        while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++        {
++            KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
++            NvRangeU64 bar1Range;
++            NvU64      bar1Base;
++            NvU64      bar1Size;
++
++            if ((pKernelBus == NULL) || (pGpu == pRequestingGpu))
++            {
++                continue;
++            }
++
++            if (kbusIsBar1Disabled(pKernelBus))
++            {
++                continue;
++            }
++
++            bar1Base = kbusGetPciBarOffset(pKernelBus, BUS_BAR_1);
++            bar1Size = kbusGetPciBarSize(pKernelBus, BUS_BAR_1);
++
++            if ((bar1Base == 0) || (bar1Size == 0))
++            {
++                continue;
++            }
++
++            NV_INIT_RANGE(bar1Range, bar1Base, bar1Base + bar1Size - 1);
++
++            if ((addrRange.min >= bar1Range.min) &&
++                (addrRange.max <= bar1Range.max))
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "BARLINK_PCIE: ALLOW range 0x%016llx-0x%016llx : "
++                          "fully inside peer GPU%u PCI BAR1 0x%016llx-0x%016llx "
++                          "(reason=PEER_BAR1_APERTURE)\n",
++                          addrRange.min, addrRange.max, gpuGetInstance(pGpu),
++                          bar1Range.min, bar1Range.max);
++                return NV_OK;
++            }
++        }
++    }
++
+     gpuInstance = 0;
+     while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+     {
+@@ -491,7 +581,7 @@ osCreateOsDescriptorFromIoMemory
+     physAddrRange.min = *base;
+     physAddrRange.max = *base + *pLimit;
+ 
+-    rmStatus = osCheckGpuBarsOverlapAddrRange(physAddrRange);
++    rmStatus = osCheckGpuBarsOverlapAddrRange(pGpu, physAddrRange);
+     if (rmStatus != NV_OK)
+     {
+         NV_PRINTF(LEVEL_ERROR,
+diff --git a/src/nvidia/interface/nvrm_registry.h b/src/nvidia/interface/nvrm_registry.h
+index ea00512..f41d0be 100644
+--- a/src/nvidia/interface/nvrm_registry.h
++++ b/src/nvidia/interface/nvrm_registry.h
+@@ -1165,6 +1165,28 @@
+ #define NV_REG_STR_RM_FORCE_STATIC_BAR1_AUTO                      0x00000002
+ #define NV_REG_STR_RM_FORCE_STATIC_BAR1_MAX                       0x00000003
+ 
++#define NV_REG_STR_BARLINK_PEER_BAR1                             "BarlinkPeerBar1"
++#define NV_REG_STR_BARLINK_PEER_BAR1_LEGACY                      "RMSmallBarP2PPeerBar1"
++// The LEGACY spelling is the name this key carried before the transport
++// was renamed from HTCCL to barlink. It is read as a fallback only, so a
++// driver already loaded and configured on a rig keeps working; new setups
++// should set BarlinkPeerBar1.
++// Type DWORD
++// Encoding Numeric Value
++// Gates the relaxation in osCheckGpuBarsOverlapAddrRange
++// (arch/nvalloc/unix/src/osmemdesc.c).
++// 0 (default) - the guard behaves exactly as shipped.
++// 1           - additionally allow a usermode I/O memory registration whose
++//               whole range lies inside the PCI BAR1 aperture of a DIFFERENT
++//               attached GPU. No static BAR1 required.
++//               This is what the dma-buf path needs: the exporting GPU maps
++//               the exported buffer into its BAR1 on demand
++//               (rm_dma_buf_map_mem_handle -> kbusMapFbAperture_HAL,
++//               arch/nvalloc/unix/src/osapi.c:5819), so the resulting bus
++//               address is somewhere in BAR1 and not in any fixed window.
++#define NV_REG_STR_BARLINK_PEER_BAR1_DISABLE              0x00000000
++#define NV_REG_STR_BARLINK_PEER_BAR1_ENABLE               0x00000001
++
+ #define NV_REG_STR_RM_BAR2_APERTURE_SIZE_MB                  "RMBar2ApertureSizeMB"
+ // Type DWORD
+ // Encoding Numeric Value

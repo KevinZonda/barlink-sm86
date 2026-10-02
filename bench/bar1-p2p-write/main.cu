@@ -40,9 +40,43 @@
 //
 // The RM ioctl and dmabuf_holder ABI definitions below are inlined (with
 // their source) so this bench is self-contained and does not depend on the
-// driver source tree. Layouts verified against
-// barlink-torch/drv/595.104.02/kernel-open/common/inc/nv-ioctl*.h and
-// barlink-pcie/dmabuf_holder/dmabuf_holder.h.
+// driver source tree. Layouts verified byte-identical against BOTH
+// barlink-torch/drv/580.178.04 and drv/595.104.02
+// (kernel-open/common/inc/nv-ioctl*.h) as well as
+// barlink-pcie/dmabuf_holder/dmabuf_holder.h; see the DRV_BRANCH block below.
+
+// ---------------------------------------------------------------------------
+// Driver branch selection (make BRANCH=580 / BRANCH=595, see Makefile).
+//
+// Verified by diffing drv/580.178.04 against drv/595.58.03/595.104.02: ALL
+// ioctl numbers, escape codes and structures this bench uses are BYTE
+// IDENTICAL across both branches (nv_ioctl_rm_api_version_t, card_info,
+// export_to_dma_buf_fd_t, NVOS21/54, NV01_ROOT/DEVICE_0,
+// NV0080_ALLOC_PARAMETERS, GPU_GET_ID_INFO_V2 0x205,
+// IMPORT_OBJECT_FROM_FD 0x3d06, NV_ESC_* numbers). What genuinely differs is
+// only the /proc/driver/nvidia/version line format and the version string the
+// kernel expects at the NV_ESC_CHECK_VERSION_STR handshake:
+//   - 595 (open kernel module): "... UNIX Open Kernel Module for x86_64
+//     595.104.02 ..."
+//   - 580 (stock module):       "... UNIX x86_64 Kernel Module  580.178.04
+//     ..."
+// DRV_BRANCH selects the fallback version string (used when the proc line
+// cannot be parsed) and labels the binary in error messages.
+// ---------------------------------------------------------------------------
+
+#ifndef DRV_BRANCH
+#define DRV_BRANCH 595
+#endif
+
+#if DRV_BRANCH == 580
+#define DRV_BRANCH_NAME    "580"
+#define DRV_BRANCH_VERSION "580.178.04"
+#elif DRV_BRANCH == 595
+#define DRV_BRANCH_NAME    "595"
+#define DRV_BRANCH_VERSION "595.104.02"
+#else
+#error "unsupported DRV_BRANCH (use 580 or 595)"
+#endif
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -443,18 +477,61 @@ static bool nvExportToDmabuf(NvExport &e, int objfd, int pciBus, size_t size)
         return false;
     }
 
-    {   // version handshake
+    {   // version handshake (NV_ESC_CHECK_VERSION_STR)
+        // The kernel (RmPerformVersionCheck, osapi.c) compares our
+        // versionString against its NV_VERSION_STRING and fails the ioctl
+        // with EINVAL on mismatch. RELAXED mode stops comparing at the first
+        // '.', so the major version is what matters. The /proc line format
+        // differs between branches:
+        //   595 open module: "... UNIX Open Kernel Module for x86_64
+        //                      595.104.02 ..."
+        //   580 stock:       "... UNIX x86_64 Kernel Module  580.178.04 ..."
         nv_ioctl_rm_api_version_t v;
         char buf[256] = {0}, ver[64] = {0};
         std::memset(&v, 0, sizeof(v));
         v.cmd = NV_RM_API_VERSION_CMD_RELAXED;
         FILE *f = std::fopen("/proc/driver/nvidia/version", "r");
         if (f) { if (!std::fgets(buf, sizeof(buf), f)) buf[0] = 0; std::fclose(f); }
-        char *p = std::strstr(buf, "for x86_64");
+        bool parsed = false;
+        const char *p = std::strstr(buf, "for x86_64");
         if (p && std::sscanf(p, "for x86_64 %63s", ver) == 1)
+            parsed = true;
+        if (!parsed && (p = std::strstr(buf, "x86_64 Kernel Module")) != nullptr &&
+            std::sscanf(p, "x86_64 Kernel Module %63s", ver) == 1)
+            parsed = true;
+        if (!parsed) {
+            // last resort: first dotted numeric token anywhere in the line
+            for (p = buf; *p; ++p) {
+                if (!isdigit((unsigned char)*p)) continue;
+                if (std::sscanf(p, "%63[0-9.]", ver) == 1 &&
+                    std::strchr(ver, '.')) { parsed = true; break; }
+            }
+        }
+        if (parsed) {
             std::strncpy(v.versionString, ver, sizeof(v.versionString) - 1);
+            std::printf("RM version handshake: sending '%s' (from /proc)\n",
+                        v.versionString);
+        } else {
+            std::strncpy(v.versionString, DRV_BRANCH_VERSION,
+                         sizeof(v.versionString) - 1);
+            std::fprintf(stderr,
+                "  could not parse /proc/driver/nvidia/version, falling back\n"
+                "  to the compile-time branch version '%s' (make BRANCH=%s)\n",
+                DRV_BRANCH_VERSION, DRV_BRANCH_NAME);
+        }
         if (nvIoctl(e.ctlFd, NV_ESC_CHECK_VERSION_STR, &v, sizeof(v)) < 0) {
-            std::perror("NV_ESC_CHECK_VERSION_STR"); return false;
+            std::fprintf(stderr,
+                "NV_ESC_CHECK_VERSION_STR failed: %s\n"
+                "  This binary was built for driver branch %s (%s).\n"
+                "  A handshake failure (EINVAL) means the version string does\n"
+                "  not match the loaded kernel module -- an ABI/branch\n"
+                "  mismatch, NOT the BAR1 guard (the guard only matters later,\n"
+                "  at cudaHostRegister). Check the loaded module with\n"
+                "      cat /proc/driver/nvidia/version\n"
+                "  and rebuild for that branch:\n"
+                "      make BRANCH=<branch>\n",
+                std::strerror(errno), DRV_BRANCH_NAME, DRV_BRANCH_VERSION);
+            return false;
         }
     }
 
@@ -1113,6 +1190,9 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "need 2 CUDA devices, found %d\n", ndev);
         return 1;
     }
+    std::printf("Binary built for driver branch %s (fallback version %s; "
+                "override with make BRANCH=580|595)\n",
+                DRV_BRANCH_NAME, DRV_BRANCH_VERSION);
 
     const size_t sweepDefault[] = { 4 << 10, 64 << 10, 1 << 20, 4 << 20,
                                     16 << 20, 64 << 20 };

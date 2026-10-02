@@ -7,12 +7,12 @@
 ## 打补丁并编译
 
 ```bash
-DRV=595.104.02   # 或 595.58.03
+DRV=595.104.02   # 或 595.58.03 / 580.178.04
 git clone --depth 1 --branch $DRV https://git.kigml.com/NVIDIA/open-gpu-kernel-modules.git drv/$DRV
 cd drv/$DRV
 git apply --check ../../patch/$DRV/BARLINK_PCIE_MINIMAL.patch   # 先验证
 git apply ../../patch/$DRV/BARLINK_PCIE_MINIMAL.patch
-make modules -j$(nproc) CC=gcc-14 HOST_CC=gcc-14
+make modules -j$(nproc)   # gcc 需 ≥ 内核构建版本（ubuntu 6.17 用 gcc-13，7.0 用系统默认 gcc-15）
 ```
 
 ## 加载（先卸 stock 驱动，Ampere 必须 PCI FLR）

@@ -38,16 +38,40 @@ Mechanism (all stock driver code except the guard, see
 ## Build & run
 
 ```
-make            # nvcc, sm_86 default; ARCH=89 or TORCH_CUDA_ARCH_LIST override
+make                    # 595 branch -> ./bar1-p2p-write
+make BRANCH=580         # 580 branch -> ./bar1-p2p-write-580
+make all-branches       # both
 sudo ./bar1-p2p-write                 # device 0 -> device 1, 64 MiB
 sudo ./bar1-p2p-write --both          # both directions
 sudo ./bar1-p2p-write --size=32M --iters=500
 ```
 
+`ARCH=8.6` / `TORCH_CUDA_ARCH_LIST` override the default sm_86.
+
+### Driver branch (580 vs 595)
+
+The inlined RM ioctl ABI (ioctl numbers, escape codes, all parameter
+structures) is **byte-identical** between the 580.178.04 and 595.x driver
+branches — verified by diffing `drv/580.178.04` against `drv/595.58.03` /
+`drv/595.104.02`. What actually differs is the **version handshake** at
+`NV_ESC_CHECK_VERSION_STR`: the kernel (`RmPerformVersionCheck`, osapi.c)
+compares the version string against its own, and the
+`/proc/driver/nvidia/version` line format differs between branches:
+
+- 595 open kernel module: `... UNIX Open Kernel Module for x86_64  595.104.02 ...`
+- 580 stock module: `... UNIX x86_64 Kernel Module  580.178.04 ...`
+
+The bench parses both formats from /proc at runtime and falls back to the
+compile-time branch version (`DRV_BRANCH_VERSION`, selected by `BRANCH=`).
+If the loaded driver is an unexpected branch, the handshake fails with
+**EINVAL** and the error message names the compiled branch and tells you to
+rebuild with the matching `make BRANCH=` — this is an ABI/branch mismatch,
+not the BAR1 guard (the guard only matters later, at `cudaHostRegister`).
+
 Exit status: 0 = byte verification passed and bandwidth measured;
 non-zero = the path is not working, the error message names the failing
-step and its most likely cause (missing patch / regkey, module not loaded,
-missing capability).
+step and its most likely cause (branch/ABI mismatch at the handshake,
+missing patch / regkey, module not loaded, missing capability).
 
 Note: `--size` must fit the 256 MiB BAR1 aperture of a 3080 (keep ≤ ~192 MiB);
 the allocation is rounded up to the VMM granularity (typically 2 MiB).
