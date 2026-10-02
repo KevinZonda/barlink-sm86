@@ -97,12 +97,26 @@ torch_ext/
 
 ## Status / TODO
 
-- `core.cu` compiles standalone with nvcc (CUDA 13.4, sm_86), both
-  `DRV_BRANCH=580` and `595`.
-- Full `setup.py` build + `import barlink_sm86` + `tests/test_basic.py`
-  require torch in `../.venv`, which is not installed yet — run the build
-  and tests once it lands (commands above; test needs the full runtime
-  stack and root).
-- Not yet done: >2 devices (needs a per-writer attachment policy in
-  dmabuf_holder), cross-process fd exchange, tensor `free` API,
-  non-u8 allreduce.
+**PASSED on real hardware** (2026-10-03): dual RTX 3080 20 GiB, patched 580.178.04
++ `BarlinkPeerBar1=1` + dmabuf_holder.ko + `iommu=pt`, torch 2.14.0+cu130.
+`tests/test_basic.py`: verify bad_bytes=0 both directions, copy_ 4 MiB
+byte-identical to CPU reference, allreduce_ both sides == (a+b)%256,
+**bandwidth 12.9 GB/s** (4 MiB per copy_ with per-copy writer drain).
+
+Hardware quirks discovered en route (encoded in core.cu comments):
+
+1. **Second+ grid-stride sweep of a `.wt` BAR1 write kernel is silently
+   dropped** -- only the first `gridDim*blockDim*16` bytes land. Always
+   launch the full grid (single sweep). The standalone bench never saw this
+   because it always did.
+2. **Cross-device cudaEvent does NOT imply PCIe posted-write drain** at the
+   peer -- readers can observe ~10% stale data. A host sync on the writer
+   stream drains them (current design, costs a few µs per op). A
+   marker-flag protocol (last store on the same posted path + reader polls
+   with `ld.global.cv`) would restore async -- TODO.
+3. Never verify inbound-written data with the copy engine (stale L2) --
+   `readback()` uses `ld.global.cv` on the owning card.
+
+Not yet done: >2 devices (needs a per-writer attachment policy in
+dmabuf_holder), cross-process fd exchange, tensor `free` API,
+non-u8 allreduce, true-async marker-flag sync.
