@@ -48,6 +48,7 @@ def _load():
 _C = _load()
 
 init = _C.init
+init_peer = _C.init_peer
 shutdown = _C.shutdown
 empty = _C.empty
 copy_ = _C.copy_
@@ -55,5 +56,47 @@ allreduce_ = _C.allreduce_
 verify = _C.verify
 readback = _C.readback
 
-__all__ = ["init", "shutdown", "empty", "copy_", "allreduce_", "verify",
-           "readback"]
+
+def _chunk_elems(itemsize, chunk_bytes):
+    # per-slice element count whose byte size is a multiple of 16 (the copy_
+    # granularity); itemsize always divides 16 for the supported dtypes
+    per = 16 // itemsize
+    return max(per, (max(16, chunk_bytes) // 16) * per)
+
+
+def copy_large(dst, src, chunk_bytes=16 << 20):
+    """Chunked bl.copy_ for tensors bigger than the pool slice that fits a
+    single call. Slices on the 16-byte copy granularity; identical
+    semantics to copy_ (SPMD symmetric discipline applies in peer mode)."""
+    total = src.numel()
+    if total == 0:
+        return
+    if src.element_size() != dst.element_size():
+        raise TypeError("barlink_sm86 copy_large: dtype mismatch")
+    step = _chunk_elems(src.element_size(), chunk_bytes)
+    if total * src.element_size() <= step * src.element_size():
+        copy_(dst, src)
+        return
+    for i in range(0, total, step):
+        j = min(i + step, total)
+        copy_(dst[i:j], src[i:j])
+
+
+def allreduce_large(a, b, chunk_bytes=16 << 20):
+    """Chunked bl.allreduce_; same SPMD discipline as allreduce_."""
+    total = a.numel()
+    if total == 0:
+        return
+    if a.element_size() != b.element_size():
+        raise TypeError("barlink_sm86 allreduce_large: dtype mismatch")
+    step = _chunk_elems(a.element_size(), chunk_bytes)
+    if total * a.element_size() <= step * a.element_size():
+        allreduce_(a, b)
+        return
+    for i in range(0, total, step):
+        j = min(i + step, total)
+        allreduce_(a[i:j], b[i:j])
+
+
+__all__ = ["init", "init_peer", "shutdown", "empty", "copy_", "allreduce_",
+           "copy_large", "allreduce_large", "verify", "readback"]
