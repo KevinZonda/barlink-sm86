@@ -1,7 +1,8 @@
-# barlink-sm86: allow non-root BAR1 P2P access.
+# barlink-sm86: allow rootless (non-sudo) BAR1 P2P access for group "kevin".
+# Code has no capable() checks; only these two file perms gate access:
 # 1. dmabuf_holder misc device (module hardcodes mode 0600)
-SUBSYSTEM=="misc", KERNEL=="dmabuf_holder", MODE="0666"
+SUBSYSTEM=="misc", KERNEL=="dmabuf_holder", MODE="0660", GROUP="kevin"
 
-# 2. PCI BAR1 sysfs resource (kernel hardcodes mode 0600; mmap itself
-#    has no CAP_SYS_RAWIO check, chmod is sufficient)
-SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", RUN+="/bin/chmod a+rw /sys/bus/pci/devices/%k/resource1_wc"
+# 2. PCI BAR1 sysfs resource (kernel hardcodes mode 0600; mmap has no
+#    CAP_SYS_RAWIO check, chown+chmod is sufficient)
+SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", RUN+="/bin/sh -c 'chmod 0660 /sys/bus/pci/devices/%k/resource1_wc && chgrp kevin /sys/bus/pci/devices/%k/resource1_wc || true'"

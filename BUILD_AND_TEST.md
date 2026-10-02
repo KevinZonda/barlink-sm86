@@ -53,8 +53,10 @@ sudo 只被两个文件权限挡住（代码本身无任何 capable() 检查）�
 
 ```bash
 sudo cp udev/99-barlink.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=pci
-sudo chmod 666 /dev/dmabuf_holder    # 本已加载的节点立即生效，重启后由规则自动设置
+sudo udevadm control --reload && sudo udevadm trigger
+# 本已存在的节点立即生效（重启后由规则自动设置）：
+sudo chown root:kevin /dev/dmabuf_holder && sudo chmod 660 /dev/dmabuf_holder
+sudo chown root:kevin /sys/bus/pci/devices/*/resource1_wc && sudo chmod 660 /sys/bus/pci/devices/*/resource1_wc
 ```
 
 之后 `bench/` 和 `torch_ext/tests/` 全部不需要 sudo；§2 的 insmod/rmmod 仍需要。
