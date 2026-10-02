@@ -1,1 +1,4 @@
-sudo chown root:root tools/blrun && sudo setcap cap_sys_admin+eip tools/blrun
+#!/bin/bash
+sudo chown root:root blrun
+sudo setcap cap_sys_admin+eip blrun
+getcap blrun
