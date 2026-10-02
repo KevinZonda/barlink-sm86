@@ -52,11 +52,27 @@ int  bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr, int srcIdx,
               size_t bytes, void *srcStream, void *dstStream,
               char *err, size_t errlen);
 
-// Two-device allreduce_: afterwards both tensors hold (a + b) elementwise
-// as wrapping u8. Internally: both directions copied into per-pool scratch
-// (original values), then each side adds its scratch locally.
+// Two-device allreduce_: afterwards both tensors hold (a + b) elementwise.
+// dtype selects the element semantics (see enum below). Internally: both
+// directions copied into per-pool scratch (original values), then each side
+// adds its scratch locally.
+//
+// Elementwise add semantics per dtype:
+//   BL_DTYPE_U8      wrapping u8 add (SIMD __vadd4), matches torch uint8 +
+//   BL_DTYPE_FP32    native float add
+//   BL_DTYPE_FP64    native double add
+//   BL_DTYPE_BF16    add via float, rounded back (torch bf16 compute rule)
+//   BL_DTYPE_FP8E4M3 add via float, converted back (SATFINITE rounding)
+//   BL_DTYPE_FP8E5M2 same
+#define BL_DTYPE_U8      0
+#define BL_DTYPE_FP32    1
+#define BL_DTYPE_FP64    2
+#define BL_DTYPE_BF16    3
+#define BL_DTYPE_FP8E4M3 4
+#define BL_DTYPE_FP8E5M2 5
 int  bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx, void *bPtr, int bIdx,
-                   size_t bytes, void *streamA, void *streamB,
+                   size_t bytes, int dtype,
+                   void *streamA, void *streamB,
                    char *err, size_t errlen);
 
 // Byte proof over all device pairs: writes a pattern through each BAR1 path

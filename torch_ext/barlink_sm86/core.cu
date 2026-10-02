@@ -43,6 +43,9 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cctype>
 #include <cerrno>
@@ -443,7 +446,7 @@ __global__ void k_verify(const uint4 *__restrict__ src, size_t n4,
 
 // Local wrapping u8 add: a[i] += b[i] (SIMD u8x4 per 32-bit lane). 'b' was
 // written by the peer through the BAR, read it with ld.global.cv; 'a' is
-// local traffic.
+// local traffic. Fast path for BL_DTYPE_U8 (kept from the byte-only era).
 __global__ void k_add(uint4 *__restrict__ a, const uint4 *__restrict__ b,
                       size_t n4)
 {
@@ -459,6 +462,91 @@ __global__ void k_add(uint4 *__restrict__ a, const uint4 *__restrict__ b,
         s.w = __vadd4(x.w, y.w);
         a[i] = s;
     }
+}
+
+// Elementwise add helpers; one overload per supported dtype. bf16/fp8 add in
+// float, matching torch's compute semantics for those dtypes.
+__device__ __forceinline__ static float  blElemAdd(float a, float b)
+{ return a + b; }
+__device__ __forceinline__ static double blElemAdd(double a, double b)
+{ return a + b; }
+__device__ __forceinline__ static __nv_bfloat16 blElemAdd(__nv_bfloat16 a,
+                                                          __nv_bfloat16 b)
+{
+    return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+}
+
+// NOTE: passing __nv_fp8_e4m3/e5m2 BY VALUE through device functions is
+// silently miscompiled by nvcc 13.4 at -O2 for sm_86 (1-byte class ABI;
+// observed: add of 1.0+3.0 yields the encoding of 72.0). The fp8 adds
+// therefore work on raw __nv_fp8_storage_t, never on the class.
+
+// Generic typed add: same 16-byte vector structure as k_add, reinterpreted
+// as T[16/sizeof(T)] inside the lane.
+template <typename T>
+__global__ void k_add_t(uint4 *__restrict__ a, const uint4 *__restrict__ b,
+                        size_t n4)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = a[i];
+        uint4 y = ldcs128(&b[i]);
+        const T *xp = reinterpret_cast<const T *>(&x);
+        const T *yp = reinterpret_cast<const T *>(&y);
+        uint4 s;
+        T *sp = reinterpret_cast<T *>(&s);
+#pragma unroll
+        for (int k = 0; k < (int)(16 / sizeof(T)); ++k)
+            sp[k] = blElemAdd(xp[k], yp[k]);
+        a[i] = s;
+    }
+}
+
+// fp8 add on raw storage, one interpretation per kernel. Adds in float
+// (torch converts fp8 to float for compute, same semantics).
+template <__nv_fp8_interpretation_t INTERP>
+__global__ void k_add_fp8(uint4 *__restrict__ a, const uint4 *__restrict__ b,
+                          size_t n4)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = a[i];
+        uint4 y = ldcs128(&b[i]);
+        const __nv_fp8_storage_t *xp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&x);
+        const __nv_fp8_storage_t *yp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&y);
+        uint4 s;
+        __nv_fp8_storage_t *sp =
+            reinterpret_cast<__nv_fp8_storage_t *>(&s);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float fa = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(xp[k], INTERP)));
+            float fb = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(yp[k], INTERP)));
+            sp[k] = __nv_cvt_float_to_fp8(fa + fb, __NV_SATFINITE, INTERP);
+        }
+        a[i] = s;
+    }
+}
+
+// Dispatch helper: pick the add kernel for the dtype enum (core.h).
+static int launchAdd(int dtype, uint4 *a, const uint4 *b, size_t n4,
+                     size_t blocks, cudaStream_t stream)
+{
+    switch (dtype) {
+    case BL_DTYPE_U8:      k_add<<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    case BL_DTYPE_FP32:    k_add_t<float><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    case BL_DTYPE_FP64:    k_add_t<double><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    case BL_DTYPE_BF16:    k_add_t<__nv_bfloat16><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    case BL_DTYPE_FP8E4M3: k_add_fp8<__NV_E4M3><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    case BL_DTYPE_FP8E5M2: k_add_fp8<__NV_E5M2><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    default: return -1;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,7 +1481,7 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
 }
 
 extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
-                             void *bPtr, int bIdx, size_t bytes,
+                             void *bPtr, int bIdx, size_t bytes, int dtype,
                              void *streamA, void *streamB,
                              char *err, size_t errlen)
 {
@@ -1401,6 +1489,10 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
     if (!ctx || aIdx == bIdx || bytes == 0 || bytes % 16 != 0) {
         setErr(err, errlen,
                "bl_allreduce_: bad argument (sizes must be multiples of 16)");
+        return -1;
+    }
+    if (dtype < BL_DTYPE_U8 || dtype > BL_DTYPE_FP8E5M2) {
+        setErr(err, errlen, "bl_allreduce_: unsupported dtype enum");
         return -1;
     }
     // scratch in each pool, exchanged in BOTH directions first; only then
@@ -1435,14 +1527,20 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
             setErr(err, errlen, "bl_allreduce_: cudaSetDevice(A) failed");
             rc = -1; goto out;
         }
-        k_add<<<gridBlocks(n4, ordA), 256, 0, (cudaStream_t)streamA>>>(
-            (uint4 *)aPtr, (const uint4 *)scratchA, n4);
+        if (launchAdd(dtype, (uint4 *)aPtr, (const uint4 *)scratchA, n4,
+                      gridBlocks(n4, ordA), (cudaStream_t)streamA) != 0) {
+            setErr(err, errlen, "bl_allreduce_: bad dtype (internal)");
+            rc = -1; goto out;
+        }
         if (cudaSetDevice(ordB) != cudaSuccess) {
             setErr(err, errlen, "bl_allreduce_: cudaSetDevice(B) failed");
             rc = -1; goto out;
         }
-        k_add<<<gridBlocks(n4, ordB), 256, 0, (cudaStream_t)streamB>>>(
-            (uint4 *)bPtr, (const uint4 *)scratchB, n4);
+        if (launchAdd(dtype, (uint4 *)bPtr, (const uint4 *)scratchB, n4,
+                      gridBlocks(n4, ordB), (cudaStream_t)streamB) != 0) {
+            setErr(err, errlen, "bl_allreduce_: bad dtype (internal)");
+            rc = -1; goto out;
+        }
         if (cudaGetLastError() != cudaSuccess) {
             setErr(err, errlen, "bl_allreduce_: add kernel launch failed");
             rc = -1; goto out;

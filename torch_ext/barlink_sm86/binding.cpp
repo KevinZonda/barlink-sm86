@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,12 +55,24 @@ static int devIndexFor(int64_t device)
     return -1;
 }
 
+// at::ScalarType -> core.h dtype enum; -1 if unsupported here.
+static int dtypeEnumFor(at::ScalarType st)
+{
+    switch (st) {
+    case at::kByte:          return BL_DTYPE_U8;
+    case at::kFloat:         return BL_DTYPE_FP32;
+    case at::kDouble:        return BL_DTYPE_FP64;
+    case at::kBFloat16:      return BL_DTYPE_BF16;
+    case at::kFloat8_e4m3fn: return BL_DTYPE_FP8E4M3;
+    case at::kFloat8_e5m2:   return BL_DTYPE_FP8E5M2;
+    default:                 return -1;
+    }
+}
+
 static void checkPoolPtr(const at::Tensor &t, int *idxOut, void **ptrOut)
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
     TORCH_CHECK(t.is_cuda(), "barlink_sm86: tensor must be a CUDA tensor");
-    TORCH_CHECK(t.scalar_type() == at::kByte,
-                "barlink_sm86: tensors are raw pool memory, dtype must be uint8");
     int idx = devIndexFor(t.get_device());
     TORCH_CHECK(idx >= 0, "barlink_sm86: tensor is on cuda:", t.get_device(),
                 " which is not in bl.init()'s device list");
@@ -109,7 +122,8 @@ void shutdown()
     g_devices.clear();
 }
 
-at::Tensor empty(int64_t nbytes, int64_t device)
+at::Tensor empty(int64_t nbytes, int64_t device,
+                 std::optional<at::ScalarType> dtype)
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
     TORCH_CHECK(nbytes > 0 && (nbytes % 16 == 0),
@@ -118,6 +132,15 @@ at::Tensor empty(int64_t nbytes, int64_t device)
     TORCH_CHECK(idx >= 0, "barlink_sm86: device ", device,
                 " not in bl.init()'s device list");
 
+    at::ScalarType st = dtype.value_or(at::kByte);
+    int dt = dtypeEnumFor(st);
+    TORCH_CHECK(dt >= 0,
+                "barlink_sm86: unsupported dtype for a pool tensor: ", st,
+                " (supported: uint8, float32, float64, bfloat16, "
+                "float8_e4m3fn, float8_e5m2)");
+    TORCH_CHECK(nbytes % (int64_t)c10::elementSize(st) == 0,
+                "barlink_sm86: nbytes must be a multiple of the item size");
+
     void *ptr = nullptr;
     char err[BL_ERRBUF] = {0};
     blCheck(bl_pool_alloc(g_ctx, idx, (size_t)nbytes, &ptr, err, sizeof(err)), err);
@@ -125,9 +148,9 @@ at::Tensor empty(int64_t nbytes, int64_t device)
     // Pool-owned memory: the deleter deliberately does nothing; the pool is
     // reclaimed at bl_shutdown(). (Freeing individual pool tensors is not
     // exposed in v1 -- the allocator would need stream-aware lifetime.)
-    return at::from_blob(ptr, {nbytes},
+    return at::from_blob(ptr, {nbytes / (int64_t)c10::elementSize(st)},
                          at::TensorOptions()
-                             .dtype(at::kByte)
+                             .dtype(st)
                              .device(at::kCUDA, (c10::DeviceIndex)device));
 }
 
@@ -139,12 +162,17 @@ void copy_(at::Tensor dst, at::Tensor src)
     checkPoolPtr(src, &srcIdx, &srcPtr);
     TORCH_CHECK(dstIdx != srcIdx, "barlink_sm86 copy_: src and dst must live "
                                   "on different pool devices");
+    TORCH_CHECK(dst.scalar_type() == src.scalar_type(),
+                "barlink_sm86 copy_: dtype mismatch (",
+                dst.scalar_type(), " vs ", src.scalar_type(), ")");
     TORCH_CHECK(dst.numel() == src.numel(),
                 "barlink_sm86 copy_: size mismatch");
-    size_t bytes = (size_t)dst.numel();
+    size_t bytes = (size_t)dst.numel() * dst.element_size();
+    TORCH_CHECK(bytes % 16 == 0,
+                "barlink_sm86 copy_: byte size must be a multiple of 16");
 
-    // current streams on the two devices; the cross-device event is recorded
-    // on the source stream and waited on the destination stream
+    // current streams on the two devices; the marker-flag wait is queued
+    // on the destination stream by bl_copy_
     cudaStream_t srcStream = at::cuda::getCurrentCUDAStream(
         src.get_device()).stream();
     cudaStream_t dstStream = at::cuda::getCurrentCUDAStream(
@@ -165,14 +193,24 @@ void allreduce_(at::Tensor a, at::Tensor b)
     checkPoolPtr(b, &bIdx, &bPtr);
     TORCH_CHECK(aIdx != bIdx, "barlink_sm86 allreduce_: tensors must live on "
                               "different pool devices");
-    TORCH_CHECK(a.numel() == b.numel() && a.numel() % 16 == 0,
-                "barlink_sm86 allreduce_: equal sizes, multiples of 16");
+    TORCH_CHECK(a.scalar_type() == b.scalar_type(),
+                "barlink_sm86 allreduce_: dtype mismatch");
+    int dt = dtypeEnumFor(a.scalar_type());
+    TORCH_CHECK(dt >= 0,
+                "barlink_sm86 allreduce_: unsupported dtype ", a.scalar_type(),
+                " (supported: uint8, float32, float64, bfloat16, "
+                "float8_e4m3fn, float8_e5m2)");
+    TORCH_CHECK(a.numel() == b.numel(),
+                "barlink_sm86 allreduce_: size mismatch");
+    size_t bytes = (size_t)a.numel() * a.element_size();
+    TORCH_CHECK(bytes % 16 == 0,
+                "barlink_sm86 allreduce_: byte size must be a multiple of 16");
 
     cudaStream_t sA = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
     cudaStream_t sB = at::cuda::getCurrentCUDAStream(b.get_device()).stream();
     c10::cuda::CUDAGuard guard(a.get_device());
     char err[BL_ERRBUF] = {0};
-    blCheck(bl_allreduce_(g_ctx, aPtr, aIdx, bPtr, bIdx, (size_t)a.numel(),
+    blCheck(bl_allreduce_(g_ctx, aPtr, aIdx, bPtr, bIdx, bytes, dt,
                           (void *)sA, (void *)sB, err, sizeof(err)), err);
 }
 
@@ -192,11 +230,13 @@ at::Tensor readback(at::Tensor t)
     int idx = 0;
     void *ptr = nullptr;
     checkPoolPtr(t, &idx, &ptr);
-    TORCH_CHECK(t.numel() % 16 == 0,
-                "barlink_sm86 readback: size must be a multiple of 16");
-    auto out = at::empty({t.numel()}, at::TensorOptions().dtype(at::kByte));
+    size_t bytes = (size_t)t.numel() * t.element_size();
+    TORCH_CHECK(bytes % 16 == 0,
+                "barlink_sm86 readback: byte size must be a multiple of 16");
+    auto out = at::empty({(int64_t)bytes},
+                         at::TensorOptions().dtype(at::kByte));
     char err[BL_ERRBUF] = {0};
-    blCheck(bl_readback(g_ctx, idx, ptr, (size_t)t.numel(), out.data_ptr(),
+    blCheck(bl_readback(g_ctx, idx, ptr, bytes, out.data_ptr(),
                         err, sizeof(err)), err);
     return out;
 }
@@ -206,7 +246,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("init", &init, py::arg("devices"), py::arg("pool_mb") = 64,
           py::call_guard<py::gil_scoped_release>());
     m.def("shutdown", &shutdown);
-    m.def("empty", &empty, py::arg("nbytes"), py::arg("device"));
+    m.def("empty", &empty, py::arg("nbytes"), py::arg("device"),
+          py::arg("dtype") = py::none());
     m.def("copy_", &copy_, py::call_guard<py::gil_scoped_release>());
     m.def("allreduce_", &allreduce_, py::call_guard<py::gil_scoped_release>());
     m.def("verify", &verify, py::call_guard<py::gil_scoped_release>());

@@ -51,12 +51,43 @@ bl.allreduce_(a, b)                     # both become (a+b) mod 256 (u8)
 bad = bl.verify()                       # byte proof over both directions
 got = bl.readback(b)                    # trustworthy host readback
 
+# typed tensors: pool memory viewed as a real dtype
+x = bl.empty(1024 * 1024, device=0, dtype=torch.float32)  # 1 MiB = 262144 floats
+y = bl.empty(1024 * 1024, device=1, dtype=torch.float32)
+bl.copy_(y, x)
+bl.allreduce_(x, y)                     # both become x+y elementwise (fp32)
+
 bl.shutdown()
 ```
 
+## dtypes
+
+`bl.empty(nbytes, device, dtype=None)` allocates raw pool bytes and returns
+the tensor viewed as `dtype` (`numel = nbytes / itemsize`; default uint8).
+`copy_` is dtype-agnostic (it moves 16-byte vectors) but requires both
+operands to have the **same** dtype and size. `allreduce_` adds
+elementwise with these semantics:
+
+| dtype | add semantics |
+|---|---|
+| `torch.uint8` | wrapping u8 (`__vadd4`), matches torch uint8 `+` |
+| `torch.float32` / `torch.float64` | native `+` |
+| `torch.bfloat16` | add in float, round to bf16 (torch's bf16 compute rule) |
+| `torch.float8_e4m3fn` / `torch.float8_e5m2` | add in float, convert back (`__NV_SATFINITE`) |
+
+Other dtypes are rejected with a clear error. Because pool memory is
+untyped, crossing dtypes between two tensors is done with `.view()` on
+either side (`bl.empty(n, dev, dt)` is exactly `bl.empty(n, dev)` +
+`.view(dt)`).
+
+Note: fp8 elementwise math uses raw `__nv_fp8_storage_t` inside the
+kernel — passing the `__nv_fp8_e4m3/e5m2` classes by value through device
+functions is silently miscompiled by nvcc 13.4 (-O2, sm_86); observed as
+`1.0 + 3.0 == 72.0`. Do not "simplify" the kernel back to the classes.
+
 Tensor sizes must be multiples of 16 bytes. Pool tensors are plain
-`torch.Tensor`s (uint8, CUDA) — they feed any torch op; only `copy_` /
-`allreduce_` / `readback` know about the pool.
+`torch.Tensor`s (CUDA, any supported dtype) — they feed any torch op; only
+`copy_` / `allreduce_` / `readback` know about the pool.
 
 ## Design constraints (all measured — do not "fix" against them)
 
@@ -79,7 +110,8 @@ Tensor sizes must be multiples of 16 bytes. Pool tensors are plain
   allocator is a bump + first-fit free list with 2 MiB alignment; pool
   tensors are not individually freed (memory is reclaimed at
   `bl.shutdown()`); `allreduce_`/`verify` scratch uses the free list.
-- v1 `allreduce_` is element-wise wrapping **u8** add (`__vadd4`).
+- `allreduce_` supports uint8 (wrapping), fp32, fp64, bf16, fp8_e4m3fn,
+  fp8_e5m2 — see the dtypes table above.
 
 ## Layout
 
@@ -92,6 +124,7 @@ torch_ext/
 │   ├── core.h                # plain-C API
 │   └── binding.cpp           # torch/pybind thin layer
 ├── tests/test_basic.py       # verify/copy_/allreduce_ vs CPU refs + small GB/s
+├── tests/test_dtypes.py      # copy_/allreduce_ across fp32/fp64/bf16/fp8/u8
 └── README.md
 ```
 
@@ -101,7 +134,9 @@ torch_ext/
 + `BarlinkPeerBar1=1` + dmabuf_holder.ko + `iommu=pt`, torch 2.14.0+cu130.
 `tests/test_basic.py`: verify bad_bytes=0 both directions, copy_ 4 MiB
 byte-identical to CPU reference, allreduce_ both sides == (a+b)%256,
-**bandwidth 12.9 GB/s** (4 MiB per copy_, sync-per-copy conservative mode).
+**bandwidth 12.9 GB/s** (4 MiB per copy_, marker-flag async mode).
+`tests/test_dtypes.py`: copy_ + allreduce_ pass for u8, fp32, fp64, bf16,
+fp8_e4m3fn, fp8_e5m2.
 
 Hardware quirks discovered en route (encoded in core.cu comments):
 
