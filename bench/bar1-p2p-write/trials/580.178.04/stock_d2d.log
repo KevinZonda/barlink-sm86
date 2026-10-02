@@ -1,0 +1,18 @@
+# stock-d2d baseline on 580.178.04
+# built with: Build cuda_13.4.r13.4/compiler.38501229_0
+2026-10-02T21:02:38+08:00
+devices: NVIDIA GeForce RTX 3080 <-> NVIDIA GeForce RTX 3080
+cudaDeviceCanAccessPeer 0->1 = 0, 1->0 = 0 (0 = locked, expect staging fallback)
+    4096 B  dir 0->1  (A) memcpyD2D     0.47 GB/s   (B) pinned staging     0.41 GB/s
+    4096 B  dir 1->0  (A) memcpyD2D     0.39 GB/s   (B) pinned staging     0.42 GB/s
+   65536 B  dir 0->1  (A) memcpyD2D     2.93 GB/s   (B) pinned staging     3.04 GB/s
+   65536 B  dir 1->0  (A) memcpyD2D     2.82 GB/s   (B) pinned staging     3.05 GB/s
+ 1048576 B  dir 0->1  (A) memcpyD2D     6.14 GB/s   (B) pinned staging     6.20 GB/s
+ 1048576 B  dir 1->0  (A) memcpyD2D     6.14 GB/s   (B) pinned staging     6.18 GB/s
+ 4194304 B  dir 0->1  (A) memcpyD2D     6.18 GB/s   (B) pinned staging     6.60 GB/s
+ 4194304 B  dir 1->0  (A) memcpyD2D     6.20 GB/s   (B) pinned staging     6.60 GB/s
+16777216 B  dir 0->1  (A) memcpyD2D     6.24 GB/s   (B) pinned staging     6.71 GB/s
+16777216 B  dir 1->0  (A) memcpyD2D     6.29 GB/s   (B) pinned staging     6.71 GB/s
+67108864 B  dir 0->1  (A) memcpyD2D     6.02 GB/s   (B) pinned staging     6.73 GB/s
+67108864 B  dir 1->0  (A) memcpyD2D     6.19 GB/s   (B) pinned staging     6.73 GB/s
+exit_code=0

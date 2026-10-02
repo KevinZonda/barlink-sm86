@@ -1,0 +1,13 @@
+# bar1-p2p-write on stock driver (expect failure)
+2026-10-02T20:32:27+08:00
+NV_ESC_CHECK_VERSION_STR: Invalid argument
+dma-buf export via the RM ioctls failed. Is the patched
+driver loaded and /dev/nvidiactl accessible?
+
+RESULT: FAILED -- see messages above.
+
+==== direction: device 0 (writer) -> device 1 (receiver) ====
+Target card (receiver) BDF = 0000:0a:00.0, source card (writer) BDF = 0000:09:00.0
+VMM granularity = 2097152, allocation size = 67108864
+VMM buffer on target card: dptr = 0x402000000, size = 67108864
+exit_code=5
