@@ -43,6 +43,8 @@ def main():
     a.copy_(ref.cuda(0))                       # local fill of the pool tensor
     b = bl.empty(N, device=1)
     bl.copy_(b, a)
+    torch.cuda.synchronize(0)  # drain probe: does host sync fix the race?
+    torch.cuda.synchronize(1)
     got = bl.readback(b)                       # copy-engine .cpu() could hit
                                                # stale L2 on inbound writes
     if not torch.equal(got, ref):
