@@ -77,3 +77,21 @@ sudo stdbuf -oL -eL $BIN --both 2>&1 | tee trials/<drv>-patched/run.log
 | 仅供 stock 的 P2P 基准 | 不会有提升。本补丁只服务 dma-buf BAR1 路径，不解锁 `cudaDeviceCanAccessPeer`/NCCL |
 
 另：卸载映射时驱动可能打 `pIOVAS != NULL` 断言噪音，不影响数据面，忽略。
+
+## 6. Bench 对比（实测）
+
+环境：双 RTX 3080 20 GiB（同 root complex），patched 580.178.04 + iommu=pt，2026-10-02。
+BAR1 直连（kernel 写对端 BAR，`--both` 两方向取一）vs stock 580（跨卡拷贝经主机内存 staging，`bench/stock-d2d`）：
+
+| size | BAR1 直连 | stock staging | 提升 |
+|---|---|---|---|
+| 4 KiB | 1.7 GB/s | 0.47 GB/s | 3.6× |
+| 64 KiB | 9.0 GB/s | 2.9 GB/s | 3.1× |
+| 1 MiB | 12.8 GB/s | 6.1 GB/s | 2.1× |
+| 16 MiB | 13.2 GB/s | 6.2 GB/s | 2.1× |
+| 64 MiB | 13.2 GB/s | 6.0 GB/s | 2.2× |
+
+- 双向对称（0→1 与 1→0 相差 <0.5%）；原始数据 `trials/580.178.04-patched/run.log`、基线 `trials/580.178.04/`
+- ≥1 MiB 的 13.2 GB/s 是链路平台期（对照 barlink-pcie 在 x8 Gen4 的 12.7 GB/s ≈ 链路 80%），补丁大小不影响带宽
+- 提升随尺寸变小而增大：大包省一半 PCIe 往返，小包还省主机往返的固定延迟
+- **对 stock CUDA/NCCL 基准（p2pBandwidthLatencyTest、nccl-tests）无提升**——补丁只服务 dma-buf BAR1 路径，不解锁 `cudaDeviceCanAccessPeer`
