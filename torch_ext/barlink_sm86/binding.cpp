@@ -171,9 +171,10 @@ at::Tensor readback(at::Tensor t)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("init", &init, py::call_guard<py::gil_scoped_release>());
+    m.def("init", &init, py::arg("devices"), py::arg("pool_mb") = 64,
+          py::call_guard<py::gil_scoped_release>());
     m.def("shutdown", &shutdown);
-    m.def("empty", &empty);
+    m.def("empty", &empty, py::arg("nbytes"), py::arg("device"));
     m.def("copy_", &copy_, py::call_guard<py::gil_scoped_release>());
     m.def("allreduce_", &allreduce_, py::call_guard<py::gil_scoped_release>());
     m.def("verify", &verify, py::call_guard<py::gil_scoped_release>());
