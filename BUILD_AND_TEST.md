@@ -72,8 +72,16 @@ bench/bar1-p2p-write/bar1-p2p-write-580 --both          # bench
 tools/caprun .venv/bin/python torch_ext/tests/test_basic.py   # torch
 ```
 
-注意：`caprun`/setcap 过的二进制等于随身携带 CAP_SYS_ADMIN（可 insmod、可 mount），
-只在单机开发环境用；§2 的 insmod/rmmod 仍需要 root。
+**caprun 的安全模型**（回应"caprun 等于随身 root"的担忧）：
+- `caprun` 启动时设 `no_new_privs`，然后才把 CAP_SYS_ADMIN 放进 ambient set
+- `bl.init()` 一成功，扩展立刻清空全部 capability set + ambient set
+- 两者叠加 = **CAP_SYS_ADMIN 只在进程启动到 init 返回之间有效，之后永久丧失且无法找回**
+  （exec 任何 setcap 二进制也拿不回来，nnp 挡死了）
+- 残留风险窗口：init 之前跑的代码（python/torch import）短暂持有 cap；之后即使进程被
+  完全攻陷，攻击者也只剩普通用户权限
+
+注意：rebuild `tools/caprun` 后需重跑上面两条 chown/setcap；bench 二进制的 cap 伴随
+整个运行期（短寿命本地测试工具，可接受）。§2 的 insmod/rmmod 仍需要 root。
 
 ## 3. Bench
 

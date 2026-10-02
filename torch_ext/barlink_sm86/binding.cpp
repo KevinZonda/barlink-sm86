@@ -7,6 +7,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -18,6 +23,20 @@ static blCtx *g_ctx = nullptr;
 static std::vector<int> g_devices;
 
 #define BL_ERRBUF 1024
+
+// CAP_SYS_ADMIN (via tools/caprun) is needed only for the
+// cudaHostRegister(IoMemory) calls inside bl_init(). Drop every capability
+// the moment init succeeds; with caprun's no_new_privs they can never be
+// regained. Harmless when the process has no caps to begin with.
+static void dropCapsAfterInit()
+{
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    struct __user_cap_header_struct hdr = {
+        _LINUX_CAPABILITY_VERSION_3, 0,
+    };
+    struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {};
+    syscall(SYS_capset, &hdr, data);
+}
 
 static void blCheck(int rc, char *errbuf)
 {
@@ -68,6 +87,7 @@ void init(std::vector<int64_t> devices, int64_t pool_mb)
     blCheck(bl_init(&ctx, devs, 2, (size_t)pool_mb << 20, err, sizeof(err)), err);
     g_ctx = ctx;
     g_devices.assign(devs, devs + 2);
+    dropCapsAfterInit();
 }
 
 void shutdown()
