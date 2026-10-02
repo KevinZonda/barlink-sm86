@@ -6,4 +6,5 @@ dist
 
 # bench build artifacts (ignore compiled binaries only; sources/trials tracked)
 bench/*/bar1-p2p-write
+bench/*/bar1-p2p-write-580
 bench/*/stock-d2d
