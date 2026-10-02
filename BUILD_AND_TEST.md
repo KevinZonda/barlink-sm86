@@ -46,20 +46,34 @@ sudo insmod dmabuf_holder/dmabuf_holder.ko
 
 ### 2b. 免 sudo 运行 bench / torch（一次性）
 
-sudo 只被两个文件权限挡住（代码本身无任何 capable() 检查）：
-`/dev/dmabuf_holder`（模块写死 0600）和
-`/sys/bus/pci/devices/*/resource1_wc`（内核写死 0600，mmap 无 CAP_SYS_RAWIO 检查）。
-装好 `udev/99-barlink.rules` 后 bench 和 torch 都用普通用户跑：
+sudo 被三层东西挡住，前两层是文件权限，第三层是进程 capability：
+
+1. `/dev/dmabuf_holder`：模块写死 0600 → udev 规则解决
+2. `/sys/bus/pci/devices/*/resource1_wc`：内核写死 0600，mmap 本身无
+   CAP_SYS_RAWIO 检查 → udev 规则 chown+chmod 解决
+3. `cudaHostRegister(IoMemory)`：RM 查 `osIsAdministrator()` =
+   `capable(CAP_SYS_ADMIN)`（`common/inc/nv-linux.h:537`），与文件权限无关
+   → 用 file capabilities 代替 sudo（见下）
 
 ```bash
 sudo cp udev/99-barlink.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
-# 本已存在的节点立即生效（重启后由规则自动设置）：
 sudo chown root:kevin /dev/dmabuf_holder && sudo chmod 660 /dev/dmabuf_holder
 sudo chown root:kevin /sys/bus/pci/devices/*/resource1_wc && sudo chmod 660 /sys/bus/pci/devices/*/resource1_wc
+# 第 3 层：caprun 启动器（torch/任意脚本）+ bench 二进制直接 setcap
+sudo chown root:root tools/caprun && sudo setcap cap_sys_admin+eip tools/caprun
+sudo chown root:root bench/bar1-p2p-write/bar1-p2p-write-* && sudo setcap cap_sys_admin+ep bench/bar1-p2p-write/bar1-p2p-write-*
 ```
 
-之后 `bench/` 和 `torch_ext/tests/` 全部不需要 sudo；§2 的 insmod/rmmod 仍需要。
+之后 bench 和 torch 全部免 sudo：
+
+```bash
+bench/bar1-p2p-write/bar1-p2p-write-580 --both          # bench
+tools/caprun .venv/bin/python torch_ext/tests/test_basic.py   # torch
+```
+
+注意：`caprun`/setcap 过的二进制等于随身携带 CAP_SYS_ADMIN（可 insmod、可 mount），
+只在单机开发环境用；§2 的 insmod/rmmod 仍需要 root。
 
 ## 3. Bench
 

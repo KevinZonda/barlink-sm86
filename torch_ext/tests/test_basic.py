@@ -2,10 +2,11 @@
 #
 # Basic test for barlink_sm86. Requires the full runtime stack:
 #   patched driver + BarlinkPeerBar1=1, dmabuf_holder.ko loaded, iommu=pt,
-#   root / CAP_SYS_ADMIN, extension built (setup.py build_ext --inplace).
+#   udev/99-barlink.rules installed (no root needed), extension built
+#   (setup.py build_ext --inplace).
 #
-# Run directly:  sudo .venv/bin/python tests/test_basic.py
-# or via pytest:  sudo .venv/bin/python -m pytest tests/ -v
+# Run directly:  .venv/bin/python tests/test_basic.py
+# or via pytest:  .venv/bin/python -m pytest tests/ -v
 
 import os
 import sys
@@ -17,8 +18,8 @@ import torch  # noqa: E402
 
 
 def require_runtime():
-    if os.geteuid() != 0:
-        print("SKIP: must run as root (dmabuf_holder is mode 0600)")
+    if not os.access("/dev/dmabuf_holder", os.R_OK | os.W_OK):
+        print("SKIP: /dev/dmabuf_holder not accessible (perms? udev rule?)")
         sys.exit(0)
     if not os.path.exists("/dev/dmabuf_holder"):
         print("SKIP: /dev/dmabuf_holder missing -- load dmabuf_holder.ko")
