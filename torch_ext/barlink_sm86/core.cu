@@ -1408,26 +1408,25 @@ static void *pathDevPtr(blCtx *ctx, int ownerIdx, int writerIdx)
     return nullptr;
 }
 
-extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
-                        void *srcPtr, int srcIdx, size_t bytes,
-                        void *srcStream, void *dstStream,
-                        char *err, size_t errlen)
+// enqueue payload + completion marker on the WRITER's stream, WITHOUT the
+// reader-side wait. Returns the flag's local-view pointer and seq so the
+// caller orders the reader itself: bl_copy_ waits immediately; bl_allreduce_
+// enqueues BOTH directions' payloads before either wait, so the two copies
+// overlap on the wire instead of serializing behind each other's flag.
+static int copyPayload(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr,
+                       int srcIdx, size_t bytes, void *srcStream,
+                       unsigned long long **flagLocalOut, uint64_t *seqOut,
+                       char *err, size_t errlen)
 {
-    setErr(err, errlen, "");
-    if (!ctx || dstIdx == srcIdx || bytes == 0 || bytes % 16 != 0) {
-        setErr(err, errlen, "bl_copy_: bad argument (src and dst must be "
-                            "different pool devices, size a multiple of 16)");
-        return -1;
-    }
     void *barDst = pathDevPtr(ctx, dstIdx, srcIdx);
     if (!barDst) {
-        setErr(err, errlen, "bl_copy_: no BAR1 write path for this pair");
+        setErr(err, errlen, "copyPayload: no BAR1 write path for this pair");
         return -1;
     }
     uintptr_t base = (uintptr_t)ctx->pools[dstIdx].dptr;
     if ((uintptr_t)dstPtr < base ||
         (uintptr_t)dstPtr + bytes > base + ctx->pools[dstIdx].usableSize) {
-        setErr(err, errlen, "bl_copy_: dst pointer outside the pool");
+        setErr(err, errlen, "copyPayload: dst pointer outside the pool");
         return -1;
     }
     uint8_t *dstBar = (uint8_t *)barDst + ((uintptr_t)dstPtr - base);
@@ -1449,7 +1448,7 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
 
     const int srcOrd = ctx->devices[srcIdx];
     if (cudaSetDevice(srcOrd) != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: cudaSetDevice failed");
+        setErr(err, errlen, "copyPayload: cudaSetDevice failed");
         return -1;
     }
     size_t n4 = bytes / 16;
@@ -1460,24 +1459,50 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
     k_mark<<<1, 1, 0, (cudaStream_t)srcStream>>>(
         (unsigned long long *)flagBar, seq);
     if (cudaGetLastError() != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: kernel launch failed");
+        setErr(err, errlen, "copyPayload: kernel launch failed");
         return -1;
     }
+    *flagLocalOut = flagLocal;
+    *seqOut = seq;
+    return 0;
+}
 
-    // reader-side wait on the DESTINATION stream: any later work queued on
-    // dstStream (torch ops, k_add, readback) is ordered after the payload.
-    // Fully async -- no host sync; see the protocol note above k_copy.
+// enqueue the reader-side wait on dstStream: any later work queued there is
+// ordered after the payload. Fully async -- no host sync.
+static int enqueueFlagWait(blCtx *ctx, int dstIdx,
+                           unsigned long long *flagLocal, uint64_t seq,
+                           void *dstStream, char *err, size_t errlen)
+{
     const int dstOrd = ctx->devices[dstIdx];
     if (cudaSetDevice(dstOrd) != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: cudaSetDevice(dst) failed");
+        setErr(err, errlen, "enqueueFlagWait: cudaSetDevice failed");
         return -1;
     }
     k_flag_wait<<<1, 32, 0, (cudaStream_t)dstStream>>>(flagLocal, seq);
     if (cudaGetLastError() != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: flag-wait launch failed");
+        setErr(err, errlen, "enqueueFlagWait: flag-wait launch failed");
         return -1;
     }
     return 0;
+}
+
+extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
+                        void *srcPtr, int srcIdx, size_t bytes,
+                        void *srcStream, void *dstStream,
+                        char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || dstIdx == srcIdx || bytes == 0 || bytes % 16 != 0) {
+        setErr(err, errlen, "bl_copy_: bad argument (src and dst must be "
+                            "different pool devices, size a multiple of 16)");
+        return -1;
+    }
+    unsigned long long *flagLocal = nullptr;
+    uint64_t seq = 0;
+    if (copyPayload(ctx, dstPtr, dstIdx, srcPtr, srcIdx, bytes, srcStream,
+                    &flagLocal, &seq, err, errlen) != 0)
+        return -1;
+    return enqueueFlagWait(ctx, dstIdx, flagLocal, seq, dstStream, err, errlen);
 }
 
 extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
@@ -1507,15 +1532,25 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
     }
 
     // scratchB (in b's pool) receives a; scratchA (in a's pool) receives b.
-    // bl_copy_ queues its k_flag_wait on the DESTINATION stream, so the adds
-    // below -- queued after the copies on their own streams -- are
-    // automatically ordered after the incoming payload.
+    // Both payloads are enqueued BEFORE either reader-side wait, so the two
+    // directions overlap on the wire (serializing them behind each other's
+    // flag costs ~30% aggregate bandwidth on this platform). The waits are
+    // queued before the adds on the same streams, so the adds -- queued
+    // after -- stay ordered after the incoming payload.
     int rc = 0;
-    if ((rc = bl_copy_(ctx, scratchB, bIdx, aPtr, aIdx, bytes,
-                       streamA, streamB, err, errlen)) != 0)
+    unsigned long long *flagInB = nullptr, *flagInA = nullptr;
+    uint64_t seq1 = 0, seq2 = 0;
+    if ((rc = copyPayload(ctx, scratchB, bIdx, aPtr, aIdx, bytes,
+                          streamA, &flagInB, &seq1, err, errlen)) != 0)
         goto out;
-    if ((rc = bl_copy_(ctx, scratchA, aIdx, bPtr, bIdx, bytes,
-                       streamB, streamA, err, errlen)) != 0)
+    if ((rc = copyPayload(ctx, scratchA, aIdx, bPtr, bIdx, bytes,
+                          streamB, &flagInA, &seq2, err, errlen)) != 0)
+        goto out;
+    if ((rc = enqueueFlagWait(ctx, bIdx, flagInB, seq1, streamB,
+                              err, errlen)) != 0)
+        goto out;
+    if ((rc = enqueueFlagWait(ctx, aIdx, flagInA, seq2, streamA,
+                              err, errlen)) != 0)
         goto out;
 
     // local adds; each side consumes its scratch (written by the peer)

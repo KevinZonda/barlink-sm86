@@ -75,6 +75,22 @@ def bidir(nbytes, iters):
     return results[0], results[1]
 
 
+def ar(nbytes, iters):
+    # allreduce_ exchanges both directions per call: 2*nbytes of payload
+    a = bl.empty(nbytes, device=0)
+    b = bl.empty(nbytes, device=1)
+    a.random_(0, 256)
+    b.random_(0, 256)
+    for _ in range(20):          # warmup
+        bl.allreduce_(a, b)
+    sync_both()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        bl.allreduce_(a, b)
+    sync_both()
+    return 2 * nbytes * iters / (time.perf_counter() - t0) / 1e9
+
+
 def main():
     global bl
     import barlink_sm86 as bl
@@ -82,16 +98,19 @@ def main():
     devs = [int(x) for x in os.environ.get("BL_DEVICES", "0,1").split(",")]
     bl.init(devices=devs, pool_mb=int(os.environ.get("BL_POOL_MB", "64")))
 
-    print("%-12s %12s %12s %12s %8s" %
-          ("size", "uni GB/s", "dir0 GB/s", "dir1 GB/s", "sum/uni"))
+    print("%-12s %12s %12s %12s %8s %10s" %
+          ("size", "uni GB/s", "dir0 GB/s", "dir1 GB/s", "sum/uni", "ar GB/s"))
     # NOTE: pool tensors are never freed, so per-device usage accumulates
-    # across sizes: 2x(1+4+16) MiB from uni + 2x(1+4+16) MiB from bidir.
-    # Run with BL_POOL_MB=192.
+    # across sizes: 2x(1+4+16) MiB from uni + 4x(1+4+16) MiB from bidir +
+    # 2x(1+4+16) MiB from ar. Run with BL_POOL_MB=192.
     for sz, iters in [(1 << 20, 512), (4 << 20, 256), (16 << 20, 128)]:
         u = uni(sz, iters)
         d0, d1 = bidir(sz, iters)
-        print("%-12s %12.2f %12.2f %12.2f %8.2fx" %
-              ("%d MiB" % (sz >> 20), u, d0, d1, (d0 + d1) / u))
+        r = ar(sz, iters)
+        print("%-12s %12.2f %12.2f %12.2f %8.2fx %10.2f" %
+              ("%d MiB" % (sz >> 20), u, d0, d1, (d0 + d1) / u, r))
+
+    print("(ar GB/s = 2x tensor bytes exchanged per allreduce_ call)")
 
 
 if __name__ == "__main__":
