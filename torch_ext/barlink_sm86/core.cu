@@ -1260,8 +1260,7 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
         return -1;
     }
 
-    // cross-device event: the reader side must not touch dst before the
-    // peer writes are complete. NEVER a flag in VRAM (L2 not coherent).
+    // cross-device event: orders the reader stream after the writer kernel.
     cudaEvent_t ev;
     if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
         setErr(err, errlen, "bl_copy_: cudaEventCreate failed");
@@ -1270,6 +1269,19 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
     cudaEventRecord(ev, (cudaStream_t)srcStream);
     cudaStreamWaitEvent((cudaStream_t)dstStream, ev, 0);
     cudaEventDestroy(ev);
+
+    // Drain the writer: kernel completion via a cross-device event does NOT
+    // mean the peer BAR1 writes reached the destination framebuffer -- posted
+    // PCIe writes can still be in flight (observed as ~10% stale reads in
+    // allreduce_, deterministic once a host sync is added). A host sync on
+    // the writer stream empirically drains them. Correctness first; a
+    // marker-flag protocol (writer's last store lands after the payload on
+    // the same posted path, reader polls it with ld.global.cv) would restore
+    // async -- TODO.
+    if (cudaStreamSynchronize((cudaStream_t)srcStream) != cudaSuccess) {
+        setErr(err, errlen, "bl_copy_: writer drain sync failed");
+        return -1;
+    }
     return 0;
 }
 
