@@ -1,0 +1,108 @@
+# barlink_sm86 — torch C++ extension for route B (dual-GPU BAR1 P2P)
+
+Wraps the byte-verified mechanism from `bench/bar1-p2p-write` as torch
+primitives: a fixed VMM **pool** per device, created once with all BAR1
+export/attach/mapping done up front; `torch.Tensor`s handed out of the pool
+via `from_blob`; cross-device `copy_` / `allreduce_` write **directly**
+through the peer card's BAR1 aperture — no host staging.
+
+## Prerequisites (identical to the bench — see `../BUILD_AND_TEST.md`)
+
+- Patched driver (`BARLINK_PCIE_MINIMAL.patch` branch 580 or 595) loaded
+  with `BarlinkPeerBar1=1`. **Never** set a static-BAR regkey.
+- `dmabuf_holder.ko` loaded (`/dev/dmabuf_holder` exists, mode 0600).
+- **AMD platform: `iommu=pt` in the kernel cmdline** — otherwise the IOMMU
+  silently drops peer BAR writes.
+- Run as root / `CAP_SYS_ADMIN`.
+- RTX 3080-class BAR1: pool must fit the 256 MiB aperture (`pool_mb <= 192`).
+
+## Build
+
+```bash
+TORCH_CUDA_ARCH_LIST="8.6" .venv/bin/python setup.py build_ext --inplace
+```
+
+**C++ standard**: torch >= 2.14 headers require C++20 (`at::symint::sizes`
+in `ATen/ExpandUtils.h` uses concepts/`requires`). setup.py therefore
+compiles the binding with `-std=c++20`; do not downgrade it to c++17 —
+gcc then mangles those template declarations and fails deep inside torch
+headers with `expected primary-expression before '>' token`. `core.cu`
+has no torch headers and is compiled with `-std=c++14`.
+
+`core.cu` alone (no torch) can be checked with plain nvcc:
+
+```bash
+nvcc -O3 -std=c++14 -gencode arch=compute_86,code=sm_86 \
+     -Ibarlink_sm86 -c barlink_sm86/core.cu -o /tmp/core.o
+```
+
+## Use
+
+```python
+import barlink_sm86 as bl
+
+bl.init(devices=[0, 1], pool_mb=64)    # one-time; creates pools + BAR1 paths
+
+a = bl.empty(4 * 1024 * 1024, device=0)   # uint8 pool tensor on device 0
+b = bl.empty(4 * 1024 * 1024, device=1)   # uint8 pool tensor on device 1
+
+bl.copy_(b, a)                          # device 0 writes device 1 via BAR1
+bl.allreduce_(a, b)                     # both become (a+b) mod 256 (u8)
+bad = bl.verify()                       # byte proof over both directions
+got = bl.readback(b)                    # trustworthy host readback
+
+bl.shutdown()
+```
+
+Tensor sizes must be multiples of 16 bytes. Pool tensors are plain
+`torch.Tensor`s (uint8, CUDA) — they feed any torch op; only `copy_` /
+`allreduce_` / `readback` know about the pool.
+
+## Design constraints (all measured — do not "fix" against them)
+
+- **No flags in the receiving card's VRAM.** The receiver's L2 is not
+  coherent with inbound PCIe writes: a spinning kernel there cannot see the
+  peer's data until it exits (`barlink-pcie/findings/l2-not-coherent.md`).
+  Synchronization is **only** cross-device `cudaEvent`s (record on the
+  writer stream, `cudaStreamWaitEvent` on the reader stream).
+- **Reads of peer-written data go through an owner-card kernel with
+  `ld.global.cv`.** A copy-engine read (`tensor.cpu()`, `cuMemcpyDtoH`) can
+  return stale L2 data. `bl.verify()` and `bl.readback()` implement this;
+  tests must not `.cpu()` a freshly cross-written tensor to judge
+  correctness.
+- Writes use grid-stride `st.global.wt` 128-bit stores (`k_copy`), the
+  kernel shape measured at 13.2 GB/s on dual 3080.
+- `allreduce_` exchanges the **original** values into per-pool scratch in
+  both directions first, then each side adds locally. Feeding the
+  already-updated peer value would double-count.
+- v1 process model: **single process, exactly 2 devices**. The pool
+  allocator is a bump + first-fit free list with 2 MiB alignment; pool
+  tensors are not individually freed (memory is reclaimed at
+  `bl.shutdown()`); `allreduce_`/`verify` scratch uses the free list.
+- v1 `allreduce_` is element-wise wrapping **u8** add (`__vadd4`).
+
+## Layout
+
+```
+torch_ext/
+├── setup.py                  # torch CUDAExtension (TORCH_CUDA_ARCH_LIST aware)
+├── barlink_sm86/
+│   ├── __init__.py           # lazy _C load, torch/CUDA sanity, actionable errors
+│   ├── core.cu               # mechanism + kernels, NO torch headers (standalone nvcc)
+│   ├── core.h                # plain-C API
+│   └── binding.cpp           # torch/pybind thin layer
+├── tests/test_basic.py       # verify/copy_/allreduce_ vs CPU refs + small GB/s
+└── README.md
+```
+
+## Status / TODO
+
+- `core.cu` compiles standalone with nvcc (CUDA 13.4, sm_86), both
+  `DRV_BRANCH=580` and `595`.
+- Full `setup.py` build + `import barlink_sm86` + `tests/test_basic.py`
+  require torch in `../.venv`, which is not installed yet — run the build
+  and tests once it lands (commands above; test needs the full runtime
+  stack and root).
+- Not yet done: >2 devices (needs a per-writer attachment policy in
+  dmabuf_holder), cross-process fd exchange, tensor `free` API,
+  non-u8 allreduce.

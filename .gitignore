@@ -19,3 +19,12 @@ Module.symvers
 modules.order
 .*.cmd
 *.swp
+
+# python venv
+.venv
+
+# torch extension build artifacts
+torch_ext/build
+torch_ext/barlink_sm86/_C*.so
+__pycache__/
+*.pyc
