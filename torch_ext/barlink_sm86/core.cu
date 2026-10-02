@@ -740,13 +740,16 @@ static const size_t kAllocAlign = 2ull << 20;
 
 static size_t gridBlocks(size_t n4, int devOrd)
 {
-    int sms = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, devOrd)
-            != cudaSuccess || sms <= 0)
-        sms = 68;
+    // Launch the FULL grid so the whole range is covered in ONE grid-stride
+    // sweep. Empirically (dual 3080, patched 580, iommu=pt) stores from the
+    // second+ sweep of a .wt BAR1 write kernel never land -- the first sweep
+    // covers exactly gridDim*blockDim*16 bytes and the rest is dropped. The
+    // standalone bench never hit this because it always launches (n4+255)/256
+    // blocks. See tests/test_basic.py history.
+    (void)devOrd;
     size_t need = (n4 + 255) / 256;
-    size_t maxB = (size_t)sms * 8;
-    return need < maxB ? need : maxB;
+    const size_t kMaxBlocks = 1u << 20;   // generous cap; 64 MiB pool needs 16384
+    return need < kMaxBlocks ? need : kMaxBlocks;
 }
 
 // ---------------------------------------------------------------------------
