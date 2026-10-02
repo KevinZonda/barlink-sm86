@@ -1,0 +1,53 @@
+Binary built for driver branch 580 (fallback version 580.178.04; override with make BRANCH=580|595)
+
+==== direction: device 0 (writer) -> device 1 (receiver) ====
+Target card (receiver) BDF = 0000:0a:00.0, source card (writer) BDF = 0000:09:00.0
+VMM granularity = 2097152, allocation size = 67108864
+VMM buffer on target card: dptr = 0x402000000, size = 67108864
+RM version handshake: sending '580.178.04' (from /proc)
+dma-buf fd = 57 (RM ioctl NV_ESC_EXPORT_TO_DMABUF_FD)
+  HOLD OK: handle 1, attached to 0000:09:00.0, dma-buf size 67108864, 1024 sg entries, total 67108864 bytes
+Target BAR1: /sys/bus/pci/devices/0000:0a:00.0/resource1_wc, size = 268435456 (0x10000000)
+BAR1 physical: 0x7fc0000000 .. 0x7fcfffffff
+BAR1 offset from sg table: 0x320000 (3 MiB into the BAR)
+BAR slice mapped: off=0x320000 len=67108864 delta=0
+cudaHostRegister(IoMemory) OK, source device pointer = 0x76a548000000
+Phase 1: pattern (67108864 bytes) written from card 0 through the peer BAR1.
+Phase 1 readback (target-card kernel, ld.global.cv): bad_bytes = 0 of 67108864
+  all bytes match -- dynamic BAR1 P2P write path works.
+Phase 1 second opinion (cuMemcpyDtoH): bad_bytes = 0 of 67108864
+
+size            iters      ms/iter         GB/s
+4096             4000       0.0024         1.68
+65536            4000       0.0073         8.96
+1048576          1024       0.0819        12.80
+4194304           256       0.3204        13.09
+16777216           64       1.2752        13.16
+67108864           50       5.0947        13.17
+
+==== direction: device 1 (writer) -> device 0 (receiver) ====
+Target card (receiver) BDF = 0000:09:00.0, source card (writer) BDF = 0000:0a:00.0
+VMM granularity = 2097152, allocation size = 67108864
+VMM buffer on target card: dptr = 0x402000000, size = 67108864
+RM version handshake: sending '580.178.04' (from /proc)
+dma-buf fd = 57 (RM ioctl NV_ESC_EXPORT_TO_DMABUF_FD)
+  HOLD OK: handle 1, attached to 0000:0a:00.0, dma-buf size 67108864, 1024 sg entries, total 67108864 bytes
+Target BAR1: /sys/bus/pci/devices/0000:09:00.0/resource1_wc, size = 268435456 (0x10000000)
+BAR1 physical: 0x7fe0000000 .. 0x7fefffffff
+BAR1 offset from sg table: 0x320000 (3 MiB into the BAR)
+BAR slice mapped: off=0x320000 len=67108864 delta=0
+cudaHostRegister(IoMemory) OK, source device pointer = 0x76a548000000
+Phase 1: pattern (67108864 bytes) written from card 1 through the peer BAR1.
+Phase 1 readback (target-card kernel, ld.global.cv): bad_bytes = 0 of 67108864
+  all bytes match -- dynamic BAR1 P2P write path works.
+Phase 1 second opinion (cuMemcpyDtoH): bad_bytes = 0 of 67108864
+
+size            iters      ms/iter         GB/s
+4096             4000       0.0024         1.71
+65536            4000       0.0073         9.01
+1048576          1024       0.0819        12.81
+4194304           256       0.3204        13.09
+16777216           64       1.2750        13.16
+67108864           50       5.0947        13.17
+
+RESULT: OK -- BAR1 P2P write path verified and measured.

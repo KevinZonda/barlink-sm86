@@ -349,6 +349,95 @@ __global__ void k_write(uint4 *__restrict__ dst, size_t n4, unsigned seed)
     }
 }
 
+// ld.global.cv: "cache volatile", fetch the line fresh instead of reusing it.
+// Read-back on the TARGET card through its OWN VMM pointer -- the verified
+// recipe from barlink-pcie/probes/dmabuf_pcie_probe.cpp.
+__device__ __forceinline__ static uint4 ldcs128(const void *p)
+{
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p) : "memory");
+    return v;
+}
+
+struct VerifyOut {
+    unsigned long long bad;       // total mismatched bytes
+    unsigned long long firstOff;  // first mismatch byte offset, ~0ULL if none
+};
+
+// Plain ld.global.cv readback of n4 uint4 elements into a staging buffer.
+// Used by the diagnostics to fetch a small VMM window to the host.
+__global__ void k_readback(const uint4 *__restrict__ src,
+                           uint4 *__restrict__ out, int n4)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n4) out[i] = ldcs128(&src[i]);
+}
+
+// Device-side byte verification, launched on the TARGET card after the write
+// kernel has fully finished (stream sync). A fresh kernel's loads see the
+// PCIe-landed data: the L2 is not coherent with incoming peer writes while a
+// kernel runs / copy engine operates, stale lines are dropped at the kernel
+// boundary (barlink-pcie/findings/l2-not-coherent.md). This is the
+// authoritative check; the host cuMemcpyDtoH readback is only a second
+// opinion (kept below in phaseVerify).
+__global__ void k_verify(const uint4 *__restrict__ src, size_t n4,
+                         unsigned seed, VerifyOut *__restrict__ out)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    unsigned long long bad = 0;
+    unsigned long long first = ~0ull;
+
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 v = ldcs128(&src[i]);
+        uint4 w;
+        w.x = patVal(i * 16, seed, 0);
+        w.y = patVal(i * 16, seed, 1);
+        w.z = patVal(i * 16, seed, 2);
+        w.w = patVal(i * 16, seed, 3);
+        if (v.x != w.x || v.y != w.y || v.z != w.z || v.w != w.w) {
+            const uint8_t *vb = (const uint8_t *)&v;
+            const uint8_t *wb = (const uint8_t *)&w;
+            for (int k = 0; k < 16; ++k) {
+                if (vb[k] != wb[k]) {
+                    ++bad;
+                    if (i * 16 + (unsigned)k < first)
+                        first = i * 16 + (unsigned)k;
+                }
+            }
+        }
+    }
+
+    __shared__ unsigned long long shBad[256 / 32];
+    __shared__ unsigned long long shFirst[256 / 32];
+    const int lane = (int)(threadIdx.x & 31);
+    const int warp = (int)(threadIdx.x >> 5);
+    for (int off = 16; off > 0; off >>= 1) {
+        unsigned long long ob = __shfl_down_sync(~0u, bad, off);
+        unsigned long long of = __shfl_down_sync(~0u, first, off);
+        bad += ob;
+        if (of < first) first = of;
+    }
+    if (lane == 0) { shBad[warp] = bad; shFirst[warp] = first; }
+    __syncthreads();
+    if (warp == 0) {
+        bad   = (lane < (int)(blockDim.x >> 5)) ? shBad[lane] : 0;
+        first = (lane < (int)(blockDim.x >> 5)) ? shFirst[lane] : ~0ull;
+        for (int off = 8; off > 0; off >>= 1) {
+            unsigned long long ob = __shfl_down_sync(~0u, bad, off);
+            unsigned long long of = __shfl_down_sync(~0u, first, off);
+            bad += ob;
+            if (of < first) first = of;
+        }
+        if (lane == 0) {
+            atomicAdd(&out->bad, bad);
+            atomicMin(&out->firstOff, first);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -735,6 +824,7 @@ struct Link {
     int      dmabufFd = -1;
     int      barFd = -1;
     void    *bar = nullptr;      // mmap'ed BAR1 slice (page-aligned)
+    uint64_t mapOff = 0;         // BAR1 offset of 'bar' within the aperture
     size_t   mapLen = 0;
     uint64_t delta = 0;          // buffer start within the mapped slice
     void    *srcDevPtr = nullptr; // device pointer on the SOURCE card
@@ -950,6 +1040,7 @@ static bool linkSetup(Link &L, int srcOrd, int dstOrd, size_t wantBytes)
     L.delta  = (uint64_t)(barOff - mapOff);
     L.mapLen = (size_t)(((L.delta + L.allocSize + pageSize - 1) / pageSize) * pageSize);
     if (mapOff + L.mapLen > barSize) L.mapLen = (size_t)(barSize - mapOff);
+    L.mapOff = mapOff;
 
     L.bar = mmap(nullptr, L.mapLen, PROT_READ | PROT_WRITE, MAP_SHARED,
                  L.barFd, (off_t)mapOff);
@@ -1017,6 +1108,14 @@ static void linkTeardown(Link &L)
 
 // ---------------------------------------------------------------------------
 // Phase 1: byte verification
+//
+// Authoritative check: a verify kernel on the TARGET card, launched after
+// the source write kernel has completely finished, reading through the
+// target card's OWN VMM pointer with ld.global.cv (see k_verify above for
+// why: the receiving card's L2 is not coherent with incoming PCIe writes,
+// so a copy-engine read can return stale data; a fresh kernel boundary
+// discards the stale lines). The host cuMemcpyDtoH readback is kept only as
+// a second opinion and does NOT decide pass/fail.
 // ---------------------------------------------------------------------------
 
 static bool phaseVerify(Link &L)
@@ -1041,35 +1140,278 @@ static bool phaseVerify(Link &L)
     std::printf("Phase 1: pattern (%zu bytes) written from card %d through the "
                 "peer BAR1.\n", bytes, L.srcOrd);
 
-    // Read back through the TARGET card's OWN VMM pointer (not the aperture).
+    // --- authoritative: device-side ld.global.cv readback on the target ------
     RT(cudaSetDevice(L.dstOrd));
     DRV(cuCtxSynchronize());
+
+    VerifyOut init = { 0, ~0ull };
+    VerifyOut res;
+    VerifyOut *dres = nullptr;
+    RT(cudaMalloc(&dres, sizeof(*dres)));
+    RT(cudaMemcpy(dres, &init, sizeof(init), cudaMemcpyHostToDevice));
+
+    RT(cudaGetDevice(&dev));
+    RT(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    blocks = (n4 + 255) / 256;
+    maxBlocks = sms * 8;
+    if (blocks > maxBlocks) blocks = maxBlocks;
+
+    k_verify<<<blocks, 256>>>(
+        (const uint4 *)((uint8_t *)L.dstDptr + L.delta), n4, seed, dres);
+    RT(cudaGetLastError());
+    RT(cudaDeviceSynchronize());
+    RT(cudaMemcpy(&res, dres, sizeof(res), cudaMemcpyDeviceToHost));
+    RT(cudaFree(dres));
+
+    std::printf("Phase 1 readback (target-card kernel, ld.global.cv): "
+                "bad_bytes = %llu of %zu\n",
+                (unsigned long long)res.bad, bytes);
+    const bool pass = (res.bad == 0);
+    if (!pass) {
+        std::fprintf(stderr,
+            "  first mismatch at byte %llu (byte offset into the buffer)\n"
+            "  The BAR1 P2P path is NOT working. Check: patched driver\n"
+            "  loaded? BarlinkPeerBar1=1 regkey? dmabuf_holder.ko loaded?\n"
+            "  CAP_SYS_ADMIN?\n", (unsigned long long)res.firstOff);
+    } else {
+        std::printf("  all bytes match -- dynamic BAR1 P2P write path works.\n");
+    }
+
+    // --- second opinion: host readback via cuMemcpyDtoH ----------------------
+    // May legitimately report mismatches where the kernel readback is clean:
+    // the copy engine can hit the same non-coherent L2 lines (see
+    // l2-not-coherent.md, variant (a)). Not pass/fail-relevant.
     std::vector<uint8_t> got(bytes);
     DRV(cuMemcpyDtoH(got.data(), L.dstDptr, bytes));
     DRV(cuCtxSynchronize());
 
-    size_t bad = 0, firstBad = (size_t)-1;
+    size_t bad2 = 0, firstBad2 = (size_t)-1;
+    uint8_t firstWant2 = 0, firstGot2 = 0;
     for (size_t i = 0; i < bytes; ++i) {
         uint8_t want = (uint8_t)(patVal(i & ~(size_t)15, seed, (int)((i & 15) >> 2))
                                  >> ((i & 3) * 8));
         if (got[i] != want) {
-            if (firstBad == (size_t)-1) firstBad = i;
-            ++bad;
+            if (firstBad2 == (size_t)-1) {
+                firstBad2 = i;
+                firstWant2 = want;
+                firstGot2 = got[i];
+            }
+            ++bad2;
         }
     }
-    std::printf("Phase 1 readback via target card's own VMM pointer: "
-                "bad_bytes = %zu of %zu\n", bad, bytes);
-    if (bad) {
+    std::printf("Phase 1 second opinion (cuMemcpyDtoH): bad_bytes = %zu of %zu"
+                "%s\n", bad2, bytes,
+                bad2 ? "  [stale-L2 readback is a known artifact, not fatal]"
+                     : "");
+    if (bad2)
         std::fprintf(stderr,
-            "  first mismatch at byte %zu (want 0x%02x, got 0x%02x)\n"
-            "  The BAR1 P2P path is NOT working. Check: patched driver\n"
-            "  loaded? BarlinkPeerBar1=1 regkey? dmabuf_holder.ko loaded?\n"
-            "  CAP_SYS_ADMIN?\n",
-            firstBad, bad ? got[firstBad] : 0, got[firstBad]);
+            "  first mismatch at byte %zu (want 0x%02x, got 0x%02x)\n",
+            firstBad2, firstWant2, firstGot2);
+
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: locate the failing layer after Phase 1 reports mismatches.
+//
+//   A  : CPU reads the BAR1 mmap (a SECOND, independent mapping -- the first
+//        one, L.bar, is cudaHostRegister'ed on the source card) after the
+//        source KERNEL wrote the pattern. If the CPU sees the pattern, the
+//        data reached FB and the problem is a BAR1-offset <-> VMM-mapping
+//        mismatch; if not, the kernel writes never reached the peer BAR
+//        (source egress problem).
+//   A2 : same CPU-BAR readback, but the pattern is written by the COPY
+//        ENGINE (cudaMemcpyAsync HtoD into srcDevPtr) instead of an SM
+//        kernel store. This is the method the original
+//        barlink-pcie/probes/dmabuf_pcie_probe.cpp used for its byte proof;
+//        if A2 works where A fails, SM st.global.wt to the peer BAR is the
+//        culprit, not the mapping.
+//   B  : CPU WRITES a pattern into the BAR mmap, then the target card reads
+//        it back with the ld.global.cv kernel through its own VMM pointer.
+//        Tests BAR1-page-table -> FB completely without any source-GPU
+//        egress.
+// ---------------------------------------------------------------------------
+
+static const size_t kDiagBytes = 4096;   // small patterns, fast even at --size=2M
+static const int    kDiagSamples = 1024;
+
+static double matchPercentBytes(const volatile uint8_t *got,
+                                size_t off, size_t len, unsigned seed)
+{
+    size_t match = 0;
+    for (size_t i = 0; i < len; ++i) {
+        size_t o = off + i;
+        uint8_t want = (uint8_t)(patVal(o & ~(size_t)15, seed,
+                                       (int)((o & 15) >> 2)) >> ((o & 3) * 8));
+        if (got[o] == want) ++match;
+    }
+    return 100.0 * (double)match / (double)len;
+}
+
+static void printHex64(const char *tag, const uint8_t *p)
+{
+    for (int r = 0; r < 4; ++r) {
+        std::printf("  %-22s %04x: ", tag, r * 16);
+        for (int c = 0; c < 16; ++c)
+            std::printf("%02x ", p[r * 16 + c]);
+        std::printf("\n");
+    }
+}
+
+static bool phaseDiagnostics(Link &L)
+{
+    const unsigned seed = 1;
+    const size_t diagBytes = kDiagBytes < L.allocSize ? kDiagBytes : L.allocSize;
+
+    std::printf("\n---- diagnostics: locating the failing layer ----\n");
+
+    // Fresh, independent CPU mapping of the same BAR1 slice. L.bar itself is
+    // registered with cudaHostRegister(IoMemory) on the source card; using a
+    // second VA keeps CPU-side diagnostics independent of that registration.
+    // Must cover the WHOLE allocation: the sample loop below reads granules
+    // spread across L.allocSize, not just the first diagBytes.
+    const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t cpuMapLen = (size_t)(((L.delta + L.allocSize + pageSize - 1) / pageSize) * pageSize);
+    void *cpuBar = mmap(nullptr, cpuMapLen, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        L.barFd, (off_t)L.mapOff);
+    if (cpuBar == MAP_FAILED) {
+        std::fprintf(stderr, "diag: mmap(second BAR view): %s\n",
+                     std::strerror(errno));
         return false;
     }
-    std::printf("  all bytes match -- dynamic BAR1 P2P write path works.\n");
-    return true;
+    const volatile uint8_t *barView = (const volatile uint8_t *)cpuBar + L.delta;
+    volatile uint8_t *barWr = (volatile uint8_t *)cpuBar + L.delta;
+
+    // 0. make sure the kernel-written pattern (seed=1) is in place
+    RT(cudaSetDevice(L.srcOrd));
+    int n4 = (int)(L.allocSize / 16);
+    k_write<<<256, 256, 0, L.stream>>>(
+        (uint4 *)((uint8_t *)L.srcDevPtr + L.delta), n4, seed);
+    RT(cudaGetLastError());
+    RT(cudaStreamSynchronize(L.stream));
+
+    // small VMM readback (target card, ld.global.cv) of the first window
+    RT(cudaSetDevice(L.dstOrd));
+    uint4 *dstage = nullptr;
+    RT(cudaMalloc(&dstage, diagBytes));
+    k_readback<<<(int)(diagBytes / 16 + 255) / 256, 256>>>(
+        (const uint4 *)((uint8_t *)L.dstDptr + L.delta), dstage,
+        (int)(diagBytes / 16));
+    RT(cudaGetLastError());
+    RT(cudaDeviceSynchronize());
+    std::vector<uint8_t> vmm(diagBytes);
+    RT(cudaMemcpy(vmm.data(), dstage, diagBytes, cudaMemcpyDeviceToHost));
+
+    // hexdump: expected pattern / BAR-CPU / VMM-kernel, first 64 bytes
+    std::vector<uint8_t> want(diagBytes);
+    for (size_t i = 0; i < diagBytes; ++i)
+        want[i] = (uint8_t)(patVal(i & ~(size_t)15, seed, (int)((i & 15) >> 2))
+                            >> ((i & 3) * 8));
+    std::printf("first 64 bytes, three views (expected / BAR-CPU / VMM-kernel):\n");
+    printHex64("expected pattern", want.data());
+    {
+        uint8_t tmp[64];
+        for (int i = 0; i < 64; ++i) tmp[i] = barView[i];
+        printHex64("BAR1-CPU readback", tmp);
+    }
+    printHex64("VMM kernel readback", vmm.data());
+
+    // A: CPU reads BAR after KERNEL write
+    double aHead = matchPercentBytes(barView, 0, diagBytes, seed);
+    size_t aSampleMatch = 0;
+    for (int k = 0; k < kDiagSamples; ++k) {
+        size_t off = (size_t)(((uint64_t)k * (uint64_t)L.allocSize)
+                              / (uint64_t)kDiagSamples) & ~(size_t)15;
+        bool ok = true;
+        for (size_t c = 0; c < 16 && off + c < L.allocSize; ++c) {
+            size_t o = off + c;
+            uint8_t w = (uint8_t)(patVal(o & ~(size_t)15, seed,
+                                        (int)((o & 15) >> 2)) >> ((o & 3) * 8));
+            if (barView[o] != w) { ok = false; break; }
+        }
+        if (ok) ++aSampleMatch;
+    }
+    std::printf("DIAG A (kernel write -> CPU read from BAR1):\n"
+                "  first %zu bytes match: %.2f%%\n"
+                "  %d sampled 16-byte granules over the buffer: %zu match\n",
+                diagBytes, aHead, kDiagSamples, aSampleMatch);
+    if (aHead > 99.0)
+        std::printf("  -> data REACHED the framebuffer. The write path works;\n"
+                    "     the BAR1 offset used for readback does not match the\n"
+                    "     VMM mapping (sg-derived offset is wrong, or the VMM\n"
+                    "     window and the BAR1 window are different buffers).\n");
+    else
+        std::printf("  -> the kernel writes NEVER reached the peer BAR1.\n"
+                    "     Suspect the source card egress: st.global.wt from an\n"
+                    "     SM kernel into the cudaHostRegister(IoMemory) window\n"
+                    "     is being dropped/misrouted. See DIAG A2.\n");
+
+    // A2: COPY-ENGINE write (the probe's method), then CPU reads BAR
+    {
+        RT(cudaSetDevice(L.srcOrd));
+        std::vector<uint8_t> ce(diagBytes);
+        for (size_t i = 0; i < diagBytes; ++i)
+            ce[i] = (uint8_t)(0xC3u ^ (uint32_t)i ^ ((uint32_t)i >> 7));
+        RT(cudaMemcpyAsync((uint8_t *)L.srcDevPtr + L.delta, ce.data(),
+                           diagBytes, cudaMemcpyHostToDevice, L.stream));
+        RT(cudaGetLastError());
+        RT(cudaStreamSynchronize(L.stream));
+        size_t match = 0;
+        for (size_t i = 0; i < diagBytes; ++i)
+            if (barView[i] == ce[i]) ++match;
+        double pct = 100.0 * (double)match / (double)diagBytes;
+        std::printf("DIAG A2 (copy-engine HtoD write -> CPU read from BAR1):\n"
+                    "  first %zu bytes match: %.2f%%\n", diagBytes, pct);
+        if (pct > 99.0 && aHead <= 99.0)
+            std::printf("  -> copy engine reaches the BAR, the SM kernel does\n"
+                        "     NOT: st.global.wt from the kernel to the\n"
+                        "     IoMemory window is the failing layer.\n");
+        else if (pct > 99.0)
+            std::printf("  -> copy engine reaches the BAR as well.\n");
+        else
+            std::printf("  -> even the copy engine cannot reach the BAR:\n"
+                        "     the source card cannot write the peer BAR1 at\n"
+                        "     all (mapping/egress below the copy engine).\n");
+    }
+
+    // B: CPU WRITES the BAR, target-card kernel reads via its own VMM pointer
+    {
+        std::vector<uint8_t> bw(diagBytes);
+        for (size_t i = 0; i < diagBytes; ++i)
+            bw[i] = (uint8_t)(0x5Au + ((uint32_t)i & 0x3f) * 3u % 197u);
+        for (size_t i = 0; i < diagBytes; ++i) barWr[i] = bw[i];
+        __sync_synchronize();
+        usleep(2000);   // let WC buffers drain to the device
+
+        RT(cudaSetDevice(L.dstOrd));
+        k_readback<<<(int)(diagBytes / 16 + 255) / 256, 256>>>(
+            (const uint4 *)((uint8_t *)L.dstDptr + L.delta), dstage,
+            (int)(diagBytes / 16));
+        RT(cudaGetLastError());
+        RT(cudaDeviceSynchronize());
+        RT(cudaMemcpy(vmm.data(), dstage, diagBytes, cudaMemcpyDeviceToHost));
+        size_t match = 0;
+        for (size_t i = 0; i < diagBytes; ++i)
+            if (vmm[i] == bw[i]) ++match;
+        double pct = 100.0 * (double)match / (double)diagBytes;
+        std::printf("DIAG B (CPU write to BAR1 -> target-kernel VMM readback):\n"
+                    "  first %zu bytes match: %.2f%%\n", diagBytes, pct);
+        if (pct > 99.0)
+            std::printf("  -> BAR1 page tables map the FB correctly; the\n"
+                        "     BAR->FB direction is fine, only the source GPU\n"
+                        "     egress fails.\n");
+        else
+            std::printf("  -> even CPU writes into BAR1 do not show up at the\n"
+                        "     VMM pointer: the BAR1 pages programmed by\n"
+                        "     nv_dma_buf_map() do NOT cover this VMM\n"
+                        "     allocation (wrong offset, or the sg table\n"
+                        "     described a different allocation).\n");
+    }
+
+    RT(cudaFree(dstage));
+    munmap(cpuBar, cpuMapLen);
+    std::printf("---- end of diagnostics ----\n");
+    return false;   // diagnostics never "fix" anything
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,7 +1496,7 @@ int main(int argc, char **argv)
 {
     size_t size = 64ull << 20;   // default 64 MiB (3080 small BAR: 256 MiB)
     int    iters = 0;            // 0 = auto
-    bool   reverse = false, both = false;
+    bool   reverse = false, both = false, diagOnly = false;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -1162,14 +1504,18 @@ int main(int argc, char **argv)
         else if (!std::strncmp(a, "--iters=", 8))  iters  = std::atoi(a + 8);
         else if (!std::strcmp (a, "--reverse"))    reverse = true;
         else if (!std::strcmp (a, "--both"))       both    = true;
+        else if (!std::strcmp (a, "--diag"))       diagOnly = true;
         else if (!std::strcmp (a, "--help")) {
-            std::printf("Usage: %s [--size=N[KMG]] [--iters=N] [--reverse|--both]\n"
+            std::printf("Usage: %s [--size=N[KMG]] [--iters=N] [--reverse|--both] [--diag]\n"
                         "  --size=N    buffer size, default 64M (must fit the\n"
                         "              256 MiB BAR1 aperture of a 3080)\n"
                         "  --iters=N   kernel writes per measurement, default\n"
                         "              auto (~1 GiB written per point)\n"
                         "  --reverse   benchmark device 1 -> device 0\n"
-                        "  --both      benchmark both directions\n", argv[0]);
+                        "  --both      benchmark both directions\n"
+                        "  --diag      skip phases 1/2, run the layer\n"
+                        "              diagnostics only (also runs automatically\n"
+                        "              after a failed phase 1)\n", argv[0]);
             return 0;
         } else {
             std::fprintf(stderr, "unknown option: %s (see --help)\n", a);
@@ -1212,7 +1558,18 @@ int main(int argc, char **argv)
                     "(receiver) ====\n", d.first, d.second);
         Link L;
         if (!linkSetup(L, d.first, d.second, size)) { ok = false; break; }
-        if (!phaseVerify(L)) { ok = false; linkTeardown(L); break; }
+        if (diagOnly) {
+            phaseDiagnostics(L);
+            ok = false;                 // diag run: no pass/fail claim
+            linkTeardown(L);
+            break;
+        }
+        if (!phaseVerify(L)) {
+            phaseDiagnostics(L);        // locate the failing layer
+            ok = false;
+            linkTeardown(L);
+            break;
+        }
         if (!phaseBandwidth(L, sweep, iters)) { ok = false; }
         linkTeardown(L);
     }

@@ -17,9 +17,14 @@ Mechanism (all stock driver code except the guard, see
    No static-BAR regkey is set anywhere.
 4. Target BAR1 (`resource1_wc`) mmap'ed, `cudaHostRegister(IoMemory)` on the
    source card, `cudaHostGetDevicePointer` → source-card device pointer.
-5. Phase 1: source kernel writes an offset-dependent pattern with
-   `st.global.wt` (128-bit); readback through the target card's own VMM
-   pointer must match byte-for-byte (`bad_bytes` must be 0).
+5. Phase 1: the source kernel writes an offset-dependent pattern with
+   `st.global.wt` (128-bit); a verify kernel on the **target card** reads it
+   back through the target's own VMM pointer with `ld.global.cv` after the
+   write kernel has finished — `bad_bytes` must be 0. This kernel readback is
+   authoritative: the receiving card's L2 is **not coherent** with incoming
+   PCIe writes, so a plain `cuMemcpyDtoH` readback (kept as a printed second
+   opinion) can return stale data
+   (`barlink-pcie/findings/l2-not-coherent.md`).
    Phase 2: size sweep (4 KiB … 64 MiB), cudaEvent-timed kernel write bursts.
 
 ## Prerequisites
@@ -44,7 +49,26 @@ make all-branches       # both
 sudo ./bar1-p2p-write                 # device 0 -> device 1, 64 MiB
 sudo ./bar1-p2p-write --both          # both directions
 sudo ./bar1-p2p-write --size=32M --iters=500
+sudo ./bar1-p2p-write --diag          # layer diagnostics only (fast: --size=2M)
 ```
+
+If Phase 1 fails, the diagnostics run automatically (same as `--diag`) and
+locate the failing layer:
+
+- **DIAG A** — CPU reads the BAR1 mmap after the source *kernel* wrote the
+  pattern: if the pattern is there, the write reached FB and the problem is
+  a BAR1-offset vs VMM-mapping mismatch; if not, the kernel stores never
+  reached the peer BAR.
+- **DIAG A2** — same, but the pattern is written by the *copy engine*
+  (`cudaMemcpyAsync` HtoD), the method the original
+  `barlink-pcie/probes/dmabuf_pcie_probe.cpp` used. Separates SM-store
+  egress failures from mapping failures.
+- **DIAG B** — the CPU *writes* the BAR and the target card reads it back
+  with the `ld.global.cv` kernel through its own VMM pointer: verifies the
+  BAR1 page tables cover this allocation, with no source-GPU egress at all.
+
+A first-64-byte hexdump (expected / BAR-CPU / VMM-kernel) is printed before
+the verdicts.
 
 `ARCH=8.6` / `TORCH_CUDA_ARCH_LIST` override the default sm_86.
 

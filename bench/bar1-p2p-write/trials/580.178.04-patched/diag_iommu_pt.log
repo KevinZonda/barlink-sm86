@@ -1,0 +1,31 @@
+# rerun with line-buffered stdout
+2026-10-02T22:00:48+08:00
+Binary built for driver branch 580 (fallback version 580.178.04; override with make BRANCH=580|595)
+
+==== direction: device 0 (writer) -> device 1 (receiver) ====
+Target card (receiver) BDF = 0000:0a:00.0, source card (writer) BDF = 0000:09:00.0
+VMM granularity = 2097152, allocation size = 2097152
+VMM buffer on target card: dptr = 0x7b59afc00000, size = 2097152
+RM version handshake: sending '580.178.04' (from /proc)
+dma-buf fd = 57 (RM ioctl NV_ESC_EXPORT_TO_DMABUF_FD)
+  HOLD OK: handle 1, attached to 0000:09:00.0, dma-buf size 2097152, 32 sg entries, total 2097152 bytes
+Target BAR1: /sys/bus/pci/devices/0000:0a:00.0/resource1_wc, size = 268435456 (0x10000000)
+BAR1 physical: 0x7fc0000000 .. 0x7fcfffffff
+BAR1 offset from sg table: 0x320000 (3 MiB into the BAR)
+BAR slice mapped: off=0x320000 len=2097152 delta=0
+cudaHostRegister(IoMemory) OK, source device pointer = 0x7b59b41de000
+
+---- diagnostics: locating the failing layer ----
+first 64 bytes, three views (expected / BAR-CPU / VMM-kernel):
+  expected pattern       0000: b5 6d df f9 0b 6b 39 f4 ed 66 25 3b f1 a9 4b 07 
+  expected pattern       0010: 9d 6d df f9 33 6b 39 f4 d5 66 25 3b c9 a9 4b 07 
+  expected pattern       0020: 84 6d df f9 1a 6b 39 f4 fc 66 25 3b e0 a9 4b 07 
+  expected pattern       0030: 8d 6d df f9 03 6b 39 f4 e5 66 25 3b f9 a9 4b 07 
+  BAR1-CPU readback      0000: b5 6d df f9 0b 6b 39 f4 ed 66 25 3b f1 a9 4b 07 
+  BAR1-CPU readback      0010: 9d 6d df f9 33 6b 39 f4 d5 66 25 3b c9 a9 4b 07 
+  BAR1-CPU readback      0020: 84 6d df f9 1a 6b 39 f4 fc 66 25 3b e0 a9 4b 07 
+  BAR1-CPU readback      0030: 8d 6d df f9 03 6b 39 f4 e5 66 25 3b f9 a9 4b 07 
+  VMM kernel readback    0000: b5 6d df f9 0b 6b 39 f4 ed 66 25 3b f1 a9 4b 07 
+  VMM kernel readback    0010: 9d 6d df f9 33 6b 39 f4 d5 66 25 3b c9 a9 4b 07 
+  VMM kernel readback    0020: 84 6d df f9 1a 6b 39 f4 fc 66 25 3b e0 a9 4b 07 
+  VMM kernel readback    0030: 8d 6d df f9 03 6b 39 f4 e5 66 25 3b f9 a9 4b 07 
