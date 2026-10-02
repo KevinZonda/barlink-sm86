@@ -4,8 +4,9 @@ output*
 dist
 .vscode
 
-# bench build artifacts
+# bench build artifacts (track sources, Makefiles, docs, trials; ignore binaries)
 bench/*/
-!bench/*/main.cu
+!bench/*/*.cu
 !bench/*/Makefile
-!bench/*/README.md
+!bench/*/*.md
+!bench/*/trials/
