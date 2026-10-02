@@ -61,9 +61,8 @@ sudo udevadm control --reload && sudo udevadm trigger
 sudo chown root:kevin /dev/dmabuf_holder && sudo chmod 660 /dev/dmabuf_holder
 sudo chown root:kevin /sys/bus/pci/devices/*/resource1_wc && sudo chmod 660 /sys/bus/pci/devices/*/resource1_wc
 # 第 3 层：blrun 启动器（torch 脚本，init 后丢权再跑 payload）
-sudo chown root:root tools/blrun tools/caprun
-sudo setcap cap_sys_admin+eip tools/blrun tools/caprun
-sudo chmod 700 tools/caprun    # 通用 trampoline 锁定 root-only，日常用 blrun
+sudo chown root:root tools/blrun
+sudo setcap cap_sys_admin+eip tools/blrun
 # bench 二进制直接 setcap（短寿命本地测试工具，cap 伴随整个运行期）
 sudo chown root:root bench/bar1-p2p-write/bar1-p2p-write-* && sudo setcap cap_sys_admin+ep bench/bar1-p2p-write/bar1-p2p-write-*
 ```
@@ -79,9 +78,8 @@ BL_POOL_MB=128 tools/blrun train.py --lr 0.01                      # 自定义 p
 **安全模型**：cap 的生存窗 = python 解释器 + torch import + `bl.init()`，全部是仓库内
 固定代码；`bl.init()` 返回即丢权（且 nnp 保证找不回），**用户脚本启动时 CapEff 已是 0**。
 即使把恶意 payload 喂给 blrun，它拿到手时也是普通用户权限。
-`tools/caprun`（通用 trampoline，等同 kevin→root 提权工具）已锁定 root-only，不要用。
 
-注意：rebuild `tools/blrun` 或 `tools/caprun` 后需重跑对应 chown/setcap；bench 二进制的 cap 伴随
+注意：rebuild `tools/blrun` 后需重跑上面两条 chown/setcap；bench 二进制的 cap 伴随
 整个运行期（短寿命本地测试工具，可接受）。§2 的 insmod/rmmod 仍需要 root。
 
 ## 3. Bench

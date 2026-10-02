@@ -25,9 +25,9 @@ static int64_t g_pool_mb = 0;
 
 #define BL_ERRBUF 1024
 
-// CAP_SYS_ADMIN (via tools/caprun) is needed only for the
+// CAP_SYS_ADMIN (via tools/blrun) is needed only for the
 // cudaHostRegister(IoMemory) calls inside bl_init(). Drop every capability
-// the moment init succeeds; with caprun's no_new_privs they can never be
+// the moment init succeeds; with blrun's no_new_privs they can never be
 // regained. Harmless when the process has no caps to begin with.
 static void dropCapsAfterInit()
 {

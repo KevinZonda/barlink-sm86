@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
 // blrun -- run a python script with barlink_sm86 pre-initialized and all
-// capabilities already dropped. Safe replacement for caprun as the normal
-// launcher: user code NEVER holds CAP_SYS_ADMIN.
+// capabilities already dropped. The only launcher: user code never holds
+// CAP_SYS_ADMIN (the generic trampoline predecessor was removed).
 //
 // Execution model:
 //   blrun (file caps cap_sys_admin+eip, root-owned)
