@@ -101,7 +101,7 @@ torch_ext/
 + `BarlinkPeerBar1=1` + dmabuf_holder.ko + `iommu=pt`, torch 2.14.0+cu130.
 `tests/test_basic.py`: verify bad_bytes=0 both directions, copy_ 4 MiB
 byte-identical to CPU reference, allreduce_ both sides == (a+b)%256,
-**bandwidth 12.9 GB/s** (4 MiB per copy_ with per-copy writer drain).
+**bandwidth 12.9 GB/s** (4 MiB per copy_, sync-per-copy conservative mode).
 
 Hardware quirks discovered en route (encoded in core.cu comments):
 
@@ -110,13 +110,35 @@ Hardware quirks discovered en route (encoded in core.cu comments):
    launch the full grid (single sweep). The standalone bench never saw this
    because it always did.
 2. **Cross-device cudaEvent does NOT imply PCIe posted-write drain** at the
-   peer -- readers can observe ~10% stale data. A host sync on the writer
-   stream drains them (current design, costs a few µs per op). A
-   marker-flag protocol (last store on the same posted path + reader polls
-   with `ld.global.cv`) would restore async -- TODO.
+   peer -- readers can observe ~10% stale data. **Fixed by the marker-flag
+   protocol** (below); host syncs are gone from `copy_`.
 3. Never verify inbound-written data with the copy engine (stale L2) --
    `readback()` uses `ld.global.cv` on the owning card.
 
+### Async copy semantics (quirk #2 fix)
+
+`copy_` is fully asynchronous. Each pool carries a reserved 4 KiB flag
+tail (not allocator-visible); per direction it holds a u64 seq `flag`
+(+8 is reserved/unused). `bl_copy_` queues on the **source** stream, in
+order: `k_copy` (payload, `st.global.wt` posted writes into the peer BAR),
+then `k_mark` (one thread: `__threadfence_system()`; then
+`st.global.wt flag = seq`). Stream order is hard execution order, so the
+single fence in `k_mark` drains **all** of `k_copy`'s posted writes before
+the flag store goes out on the same PCIe path — flag arrival implies
+payload arrival. (An earlier design had every payload block do its own
+system fence plus an atomic block counter; that cost ~1 us per block, i.e.
+~1 ms per 4 MiB copy, and dropped bandwidth from 12.9 to 3.3 GB/s.)
+
+The reader (`k_flag_wait` on the destination stream) polls only the flag
+with `ld.global.cv` (~3.2 us latency), with a ~2 s trap-on-timeout.
+
+Semantics: `bl.copy_(b, a)` returns with the copy merely **queued**; any
+work the consumer queues afterwards on `b`'s current stream (torch ops,
+another `copy_`, `readback`) is stream-ordered after the payload. There is
+no cross-copy source-buffer reuse hazard: pool tensors are never freed, so
+an in-flight `copy_` can never observe its source reallocated.
+
 Not yet done: >2 devices (needs a per-writer attachment policy in
 dmabuf_holder), cross-process fd exchange, tensor `free` API,
-non-u8 allreduce, true-async marker-flag sync.
+non-u8 allreduce, stream-aware scratch free in `allreduce_` (host sync
+kept, see TODO in core.cu).

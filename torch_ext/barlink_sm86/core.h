@@ -40,10 +40,14 @@ int  bl_pool_alloc(blCtx *ctx, int devIdx, size_t bytes, void **ptrOut,
 int  bl_pool_free(blCtx *ctx, int devIdx, void *ptr, size_t bytes);
 
 // Copy 'bytes' from the src pool tensor to the dst pool tensor across the
-// BAR1 direct path: launched on the source device (srcStream), reading src
-// locally and writing into dst's BAR1 window with st.global.wt; a
-// cross-device cudaEvent (record on srcStream, wait on dstStream) orders
-// the write before any subsequent dst-side work.
+// BAR1 direct path, fully async (marker-flag protocol, no host sync):
+// k_copy on the source device (srcStream) writes dst's BAR1 window with
+// st.global.wt and publishes a seq flag after its last payload store;
+// k_flag_wait on the destination device (dstStream) polls the flag with
+// ld.global.cv and unblocks when it arrives. Semantics: when bl_copy_
+// returns, the copy is merely QUEUED -- the data is usable by any work the
+// caller queues afterwards on dstStream (torch ops see the same ordering);
+// consuming from a different stream requires the caller's own ordering.
 int  bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr, int srcIdx,
               size_t bytes, void *srcStream, void *dstStream,
               char *err, size_t errlen);

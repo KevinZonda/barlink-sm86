@@ -24,11 +24,14 @@
 //      receiving card's L2 is NOT coherent with incoming PCIe writes --
 //      barlink-pcie/findings/l2-not-coherent.md).
 //
-// HARD RULE (measured, do not violate): synchronization flags must NEVER
-// live in the receiving card's VRAM. A spinning kernel on the receiver
-// cannot observe incoming peer writes until it exits. Only cross-device
-// cudaEvents (record on the writer stream, cudaStreamWaitEvent on the
-// reader stream) are used here.
+// HARD RULE (measured, do not violate): a receiver-side kernel must NEVER
+// poll payload data written by the peer -- the receiver's L2 is not
+// coherent with inbound PCIe writes and a spinning kernel keeps reading the
+// stale line (barlink-pcie/findings/l2-not-coherent.md). Synchronization
+// uses a marker flag in the pool's flag tail: the writer's LAST posted
+// store is the flag itself (same PCIe path, in-order delivery), and the
+// reader polls only the flag, with ld.global.cv, which bypasses L2 and
+// DOES see inbound writes (l2-coherence-bypassable.md, ~3.2 us).
 //
 // This file has no torch dependency and compiles standalone:
 //   nvcc -O3 -std=c++14 -gencode arch=compute_86,code=sm_86 \
@@ -275,8 +278,42 @@ __device__ __forceinline__ static uint4 ldcs128(const void *p)
     return v;
 }
 
+// Marker-flag async copy protocol
+// -------------------------------
+// Flags live in the OWNER pool's reserved 4 KiB tail (see Pool::usableSize);
+// each incoming direction (one per writer device) owns a 256-byte slot:
+//   +0: flag (u64 seq) -- in use
+//   +8: done (u64)     -- reserved, unused by the current protocol
+//
+// Ordering argument: bl_copy_ launches, in order on the SOURCE stream,
+//   k_copy  (payload, st.global.wt posted writes into the peer BAR)
+//   k_mark  (single thread: __threadfence_system(); st.global.wt flag = seq)
+// Stream order is hard execution order: k_mark starts only after k_copy has
+// completely finished. __threadfence_system() in k_mark waits until ALL
+// writes causally prior to it -- every posted payload write of k_copy --
+// are visible at system scope, i.e. actually delivered; the flag store is
+// issued after the fence. PCIe delivers posted writes from one source over
+// one path in order: flag arrival implies payload arrival. Cost: ONE fence
+// and one tiny kernel launch per copy, instead of a per-block fence (a
+// system fence per block costs ~1 us; at 1024 blocks that is ~1 ms per
+// 4 MiB copy -- measured as the bandwidth regression this design fixes).
+//
+// The reader polls the flag through its LOCAL VMM pointer with ld.global.cv
+// (bypasses L2; a spinning kernel CAN see inbound peer writes that way --
+// barlink-pcie/findings/l2-coherence-bypassable.md, ~3.2 us). It never
+// spins on payload. The flag value is monotone (u64 seq, 0 = never), so
+// multiple in-flight copies are safe: flag >= seq for a later seq implies
+// the earlier copy's payload landed too.
+
+__device__ __forceinline__ static void stwt64(void *p, unsigned long long v)
+{
+    asm volatile("st.global.wt.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+
 // Cross-device copy: read local 'src', st.global.wt into the PEER BAR window
 // 'dst' (a cudaHostRegister(IoMemory) device pointer on THIS device).
+// Pure payload kernel -- no synchronization logic here; k_mark publishes the
+// flag after this kernel completes (same stream).
 __global__ void k_copy(const uint4 *__restrict__ src, uint4 *__restrict__ dst,
                        size_t n4)
 {
@@ -284,6 +321,37 @@ __global__ void k_copy(const uint4 *__restrict__ src, uint4 *__restrict__ dst,
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride)
         stwt128(&dst[i], src[i]);
+}
+
+// Completion marker: one thread. The system fence drains every posted
+// payload write causally prior to this kernel (stream order), then the
+// flag store goes out on the same posted path, after all of them.
+__global__ void k_mark(unsigned long long *flag, unsigned long long seq)
+{
+    __threadfence_system();
+    stwt64(flag, seq);
+}
+
+// Reader-side wait: poll the local flag with ld.global.cv until flag >= seq.
+// One block; timeout ~2 s -> __trap() surfaces as a CUDA error on sync.
+__global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
+                            unsigned long long seq)
+{
+    if (threadIdx.x == 0) {
+        const long long t0 = clock64();
+        unsigned ns = 32;
+        for (;;) {
+            unsigned long long v;
+            asm volatile("ld.global.cv.u64 %0, [%1];"
+                         : "=l"(v) : "l"(flag) : "memory");
+            if (v >= seq) break;
+            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000)  // ~2-3 s @ ~1.5-2 GHz
+                __trap();
+            __nanosleep(ns);
+            if (ns < (1u << 20)) ns <<= 1;
+        }
+    }
+    __syncthreads();
 }
 
 // Pattern writer (used by bl_verify): writes patVal(seed) into the peer BAR.
@@ -712,7 +780,8 @@ struct Pool {
     int      devIdx = -1;    // index into ctx->devices
     CUdeviceptr dptr = 0;    // VMM pointer on the owner card
     CUmemGenericAllocationHandle memHandle = 0;
-    size_t   size = 0;
+    size_t   size = 0;       // total VMM allocation
+    size_t   usableSize = 0; // size minus the reserved 4 KiB flag tail
 
     NvExport nvx;
     int      dmabufFd = -1;
@@ -734,7 +803,24 @@ struct blCtx {
     int    ndev = 0;
     size_t poolBytes = 0;
     Pool   pools[BL_MAX_DEVICES];
+
+    // marker-flag protocol state (see k_copy): per-direction sequence
+    // counters; dirSeq[w] = copies issued BY writer w (v1: one writer per
+    // pool, so this is also the incoming seq of the other pool).
+    std::mutex seqMu;
+    uint64_t dirSeq[BL_MAX_DEVICES] = {0};
+    uint64_t lastIncoming[BL_MAX_DEVICES] = {0};  // highest seq landed per pool
 };
+
+// Reserved pool tail for the flag slots (one 256-byte slot per writer
+// direction; u64 flag at +0, u64 done counter at +8). Written by peers
+// through the BAR, polled locally with ld.global.cv.
+#define BL_FLAG_REGION 4096u
+#define BL_FLAG_SLOT   256u
+static size_t flagOff(const Pool &P, int writerIdx)
+{
+    return P.size - BL_FLAG_REGION + (size_t)writerIdx * BL_FLAG_SLOT;
+}
 
 static const size_t kAllocAlign = 2ull << 20;
 
@@ -759,11 +845,12 @@ static size_t gridBlocks(size_t n4, int devOrd)
 static bool poolAllocLocked(Pool &p, size_t bytes, size_t *offOut, std::string &err)
 {
     bytes = (bytes + 15) & ~(size_t)15;
-    // first fit in the free list
+    // first fit in the free list; never touch the flag tail
     for (size_t i = 0; i < p.freeList.size(); ++i) {
         size_t o = (p.freeList[i].first + kAllocAlign - 1) & ~(kAllocAlign - 1);
         size_t end = o + bytes;
-        if (end <= p.freeList[i].first + p.freeList[i].second) {
+        if (end <= p.freeList[i].first + p.freeList[i].second &&
+            end <= p.usableSize) {
             size_t tail0 = p.freeList[i].first;
             size_t tailLen = p.freeList[i].second - (o - p.freeList[i].first) - bytes;
             p.freeList.erase(p.freeList.begin() + i);
@@ -774,13 +861,13 @@ static bool poolAllocLocked(Pool &p, size_t bytes, size_t *offOut, std::string &
         }
     }
     size_t o = (p.bump + kAllocAlign - 1) & ~(kAllocAlign - 1);
-    if (o + bytes > p.size) {
+    if (o + bytes > p.usableSize) {
         char b[320];
         std::snprintf(b, sizeof(b),
-            "pool on device %d exhausted: need %zu more, pool size %zu. "
-            "Free tensors cannot be reclaimed (pool tensors are not freed "
-            "individually); increase pool_mb.",
-            p.devIdx, bytes, p.size);
+            "pool on device %d exhausted: need %zu more, usable pool size "
+            "%zu (4 KiB flag tail reserved). Free tensors cannot be reclaimed "
+            "(pool tensors are not freed individually); increase pool_mb.",
+            p.devIdx, bytes, p.usableSize);
         err = b;
         return false;
     }
@@ -856,6 +943,7 @@ static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
             != CUDA_SUCCESS || gran == 0)
         gran = 2ull << 20;
     P.size = (ctx->poolBytes + gran - 1) / gran * gran;
+    P.usableSize = P.size - BL_FLAG_REGION;   // flag slots live in the tail
 
     if (cuMemCreate(&P.memHandle, P.size, &prop, 0) != CUDA_SUCCESS) {
         std::snprintf(b, sizeof(b),
@@ -1088,6 +1176,15 @@ static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
         wp.devPtr = (uint8_t *)wp.devPtr + delta;
     }
 
+    // zero the flag region on the owner card (local memset; no traffic yet)
+    ce = cudaSetDevice(ord);
+    if (ce != cudaSuccess ||
+        cudaMemset((void *)(P.dptr + flagOff(P, 0)), 0,
+                   BL_FLAG_REGION) != cudaSuccess) {
+        setErr(err, errlen, "setupPool: flag-region memset failed");
+        return false;
+    }
+
     return true;
 }
 
@@ -1241,11 +1338,26 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
     }
     uintptr_t base = (uintptr_t)ctx->pools[dstIdx].dptr;
     if ((uintptr_t)dstPtr < base ||
-        (uintptr_t)dstPtr + bytes > base + ctx->pools[dstIdx].size) {
+        (uintptr_t)dstPtr + bytes > base + ctx->pools[dstIdx].usableSize) {
         setErr(err, errlen, "bl_copy_: dst pointer outside the pool");
         return -1;
     }
     uint8_t *dstBar = (uint8_t *)barDst + ((uintptr_t)dstPtr - base);
+
+    // this direction's sequence number (starts at 1; 0 means "never copied")
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        seq = ++ctx->dirSeq[srcIdx];
+        ctx->lastIncoming[dstIdx] = seq;
+    }
+
+    // flag slot of this direction: BAR view (writer) and local VMM view
+    // (reader). One slot per writer, in the owner pool's reserved tail.
+    uint8_t *flagBar = (uint8_t *)barDst + flagOff(ctx->pools[dstIdx], srcIdx);
+    unsigned long long *flagLocal =
+        (unsigned long long *)(uintptr_t)(ctx->pools[dstIdx].dptr +
+                                          flagOff(ctx->pools[dstIdx], srcIdx));
 
     const int srcOrd = ctx->devices[srcIdx];
     if (cudaSetDevice(srcOrd) != cudaSuccess) {
@@ -1255,31 +1367,26 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
     size_t n4 = bytes / 16;
     k_copy<<<gridBlocks(n4, srcOrd), 256, 0, (cudaStream_t)srcStream>>>(
         (const uint4 *)srcPtr, (uint4 *)dstBar, n4);
+    // completion marker on the SAME stream: hard kernel ordering makes the
+    // fence cover all of k_copy's posted writes (see protocol note above)
+    k_mark<<<1, 1, 0, (cudaStream_t)srcStream>>>(
+        (unsigned long long *)flagBar, seq);
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "bl_copy_: kernel launch failed");
         return -1;
     }
 
-    // cross-device event: orders the reader stream after the writer kernel.
-    cudaEvent_t ev;
-    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: cudaEventCreate failed");
+    // reader-side wait on the DESTINATION stream: any later work queued on
+    // dstStream (torch ops, k_add, readback) is ordered after the payload.
+    // Fully async -- no host sync; see the protocol note above k_copy.
+    const int dstOrd = ctx->devices[dstIdx];
+    if (cudaSetDevice(dstOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_copy_: cudaSetDevice(dst) failed");
         return -1;
     }
-    cudaEventRecord(ev, (cudaStream_t)srcStream);
-    cudaStreamWaitEvent((cudaStream_t)dstStream, ev, 0);
-    cudaEventDestroy(ev);
-
-    // Drain the writer: kernel completion via a cross-device event does NOT
-    // mean the peer BAR1 writes reached the destination framebuffer -- posted
-    // PCIe writes can still be in flight (observed as ~10% stale reads in
-    // allreduce_, deterministic once a host sync is added). A host sync on
-    // the writer stream empirically drains them. Correctness first; a
-    // marker-flag protocol (writer's last store lands after the payload on
-    // the same posted path, reader polls it with ld.global.cv) would restore
-    // async -- TODO.
-    if (cudaStreamSynchronize((cudaStream_t)srcStream) != cudaSuccess) {
-        setErr(err, errlen, "bl_copy_: writer drain sync failed");
+    k_flag_wait<<<1, 32, 0, (cudaStream_t)dstStream>>>(flagLocal, seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_copy_: flag-wait launch failed");
         return -1;
     }
     return 0;
@@ -1307,7 +1414,10 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
         return -1;
     }
 
-    // scratchB (in b's pool) receives a; scratchA (in a's pool) receives b
+    // scratchB (in b's pool) receives a; scratchA (in a's pool) receives b.
+    // bl_copy_ queues its k_flag_wait on the DESTINATION stream, so the adds
+    // below -- queued after the copies on their own streams -- are
+    // automatically ordered after the incoming payload.
     int rc = 0;
     if ((rc = bl_copy_(ctx, scratchB, bIdx, aPtr, aIdx, bytes,
                        streamA, streamB, err, errlen)) != 0)
@@ -1316,7 +1426,7 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
                        streamB, streamA, err, errlen)) != 0)
         goto out;
 
-    // local adds after both cross events
+    // local adds; each side consumes its scratch (written by the peer)
     {
         const int ordA = ctx->devices[aIdx];
         const int ordB = ctx->devices[bIdx];
@@ -1340,7 +1450,9 @@ extern "C" int bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx,
     }
 
 out:
-    // scratch must not be reused until both sides consumed it
+    // TODO: the scratch could be freed stream-aware (event instead of host
+    // sync); v1 keeps the conservative drain before returning it to the
+    // allocator.
     cudaSetDevice(ctx->devices[aIdx]);
     cudaDeviceSynchronize();
     cudaSetDevice(ctx->devices[bIdx]);
@@ -1430,6 +1542,25 @@ extern "C" int bl_readback(blCtx *ctx, int devIdx, void *ptr, size_t bytes,
     if (cudaSetDevice(ord) != cudaSuccess) {
         setErr(err, errlen, "bl_readback: cudaSetDevice failed");
         return -1;
+    }
+    // wait for the most recent inbound copy to this pool (queued on the
+    // legacy default stream, which is synchronizing with the users' blocking
+    // streams; TODO: take an explicit stream argument for non-blocking
+    // stream users)
+    uint64_t waitSeq;
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        waitSeq = ctx->lastIncoming[devIdx];
+    }
+    if (waitSeq > 0) {
+        int wIdx = (devIdx + 1) % ctx->ndev;   // v1: exactly one writer
+        unsigned long long *flagLocal = (unsigned long long *)(uintptr_t)(
+            P.dptr + flagOff(P, wIdx));
+        k_flag_wait<<<1, 32>>>(flagLocal, waitSeq);
+        if (cudaGetLastError() != cudaSuccess) {
+            setErr(err, errlen, "bl_readback: flag-wait launch failed");
+            return -1;
+        }
     }
     size_t n4 = bytes / 16;
     void *stage = nullptr;
