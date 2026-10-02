@@ -21,7 +21,7 @@ cd drv/$DRV
 git apply ../../patch/$DRV/BARLINK_PCIE_MINIMAL.patch
 make modules -j$(nproc)                          # gcc 需 ≥ 内核构建版本
 cd ../../..
-make -C ~/projects/nv-p2p/barlink-pcie/dmabuf_holder   # 独立 .ko，与 GPU 驱动零依赖
+make -C dmabuf_holder   # 独立 .ko，与 GPU 驱动零依赖
 cd bench/bar1-p2p-write
 make all-branches                                # 产出 bar1-p2p-write(595) 和 -580
 ```
@@ -38,7 +38,7 @@ echo 1 | sudo tee /sys/bus/pci/devices/0000:0a:00.0/reset
 cd ~/projects/nv-p2p/barlink-torch
 sudo insmod drv/$DRV/kernel-open/nvidia.ko NVreg_RegistryDwords="BarlinkPeerBar1=1"
 sudo insmod drv/$DRV/kernel-open/nvidia-uvm.ko
-sudo insmod ~/projects/nv-p2p/barlink-pcie/dmabuf_holder/dmabuf_holder.ko
+sudo insmod dmabuf_holder/dmabuf_holder.ko
 ```
 
 只需 `BarlinkPeerBar1=1` 一个 key。**绝不设** `RMForceStaticBar1`。
