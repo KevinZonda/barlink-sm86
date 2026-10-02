@@ -18,3 +18,4 @@ bench/*/stock-d2d
 Module.symvers
 modules.order
 .*.cmd
+*.swp
