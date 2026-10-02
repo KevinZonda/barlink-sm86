@@ -49,6 +49,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -60,9 +61,14 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "core.h"
@@ -285,21 +291,32 @@ __device__ __forceinline__ static uint4 ldcs128(const void *p)
 // -------------------------------
 // Flags live in the OWNER pool's reserved 4 KiB tail (see Pool::usableSize);
 // each incoming direction (one per writer device) owns a 256-byte slot:
-//   +0: flag (u64 seq) -- in use
-//   +8: done (u64)     -- reserved, unused by the current protocol
+//   +0: flag (u64 seq) -- payload-complete marker (written by the writer)
+//   +8: arm  (u64 seq) -- buffer-ready marker (written LOCALLY by the
+//                        owner, polled by the writer through its BAR view)
 //
-// Ordering argument: bl_copy_ launches, in order on the SOURCE stream,
-//   k_copy  (payload, st.global.wt posted writes into the peer BAR)
-//   k_mark  (single thread: __threadfence_system(); st.global.wt flag = seq)
-// Stream order is hard execution order: k_mark starts only after k_copy has
-// completely finished. __threadfence_system() in k_mark waits until ALL
-// writes causally prior to it -- every posted payload write of k_copy --
-// are visible at system scope, i.e. actually delivered; the flag store is
-// issued after the fence. PCIe delivers posted writes from one source over
-// one path in order: flag arrival implies payload arrival. Cost: ONE fence
-// and one tiny kernel launch per copy, instead of a per-block fence (a
-// system fence per block costs ~1 us; at 1024 blocks that is ~1 ms per
-// 4 MiB copy -- measured as the bandwidth regression this design fixes).
+// The arm handshake closes the fill race that exists in ANY cross-process
+// design: a local write to a buffer (the user's fill) is only ordered on the
+// owner's stream, so the peer's remote write to the same buffer could
+// otherwise land first and be overwritten. Per exchange step (seq k), on
+// each rank, all on one stream:
+//   1. owner stores arm = k locally    -- stream-ordered AFTER the caller's
+//                                         fills, visible to the peer's BAR
+//                                         reads (local .wt store, FB-backed)
+//   2. writer polls peer's arm >= k    -- BAR-view ld.global.cv (BAR reads
+//                                         hit framebuffer, bypassing the
+//                                         local L2 that hides inbound writes)
+//   3. writer k_copy payload + k_mark completion = k (same stream: one fence
+//      + one flag cover the posted writes; PCIe delivers them in order)
+//   4. owner polls its LOCAL completion flag >= k (ld.global.cv sees inbound
+//      PCIe writes -- barlink-pcie/findings/l2-coherence-bypassable.md)
+// Arm stores always precede arm waits on both sides, so the handshake
+// cannot deadlock; a rank running ahead simply spins in step 2.
+//
+// Cost per copy: one local arm store + one BAR poll + one completion poll,
+// instead of a per-block fence (a system fence per block costs ~1 us; at
+// 1024 blocks that is ~1 ms per 4 MiB copy -- measured as the bandwidth
+// regression this design fixes).
 //
 // The reader polls the flag through its LOCAL VMM pointer with ld.global.cv
 // (bypasses L2; a spinning kernel CAN see inbound peer writes that way --
@@ -869,7 +886,8 @@ struct Pool {
     CUdeviceptr dptr = 0;    // VMM pointer on the owner card
     CUmemGenericAllocationHandle memHandle = 0;
     size_t   size = 0;       // total VMM allocation
-    size_t   usableSize = 0; // size minus the reserved 4 KiB flag tail
+    size_t   usableSize = 0; // user-allocatable limit (flag tail always
+                             // excluded; in peer mode also the scratch half)
 
     NvExport nvx;
     int      dmabufFd = -1;
@@ -877,6 +895,10 @@ struct Pool {
     uint32_t holderHandle = 0;
     int      barFd = -1;
     uint64_t barOff = 0;     // buffer start within the BAR1 aperture
+    uint64_t barSize = 0;    // BAR1 aperture size (from resource1_wc fstat)
+    uint64_t bar1Start = 0, bar1End = 0;  // BAR1 physical range (sysfs)
+    bool     haveBar1Phys = false;
+    uint8_t  magic[64] = {0};              // marker for the BAR1 scan fallback
 
     std::vector<WritePath> paths;
 
@@ -898,6 +920,14 @@ struct blCtx {
     std::mutex seqMu;
     uint64_t dirSeq[BL_MAX_DEVICES] = {0};
     uint64_t lastIncoming[BL_MAX_DEVICES] = {0};  // highest seq landed per pool
+
+    // cross-process (SPMD peer) mode: this process owns exactly ONE GPU,
+    // devices[myRank]; devices[1-myRank] is the peer (ordinal -1 locally).
+    // pools[myRank] is the real local pool; pools[peer] is a pseudo-entry
+    // holding only the BAR1 write path into the peer's pool.
+    bool     peerMode = false;
+    int      myRank = -1;
+    size_t   scratchBase = 0;   // peer mode: user tensors live below this
 };
 
 // Reserved pool tail for the flag slots (one 256-byte slot per writer
@@ -987,7 +1017,10 @@ static void poolFreeLocked(Pool &p, size_t off, size_t bytes)
 // Setup: one pool + all its write paths
 // ---------------------------------------------------------------------------
 
-static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
+// Local half of pool setup: context creation on the owner card, VMM pool
+// allocation, dma-buf export, and opening the owner's BAR1 aperture.
+// Shared by single-process bl_init and cross-process bl_init_peer.
+static bool poolLocalSetup(blCtx *ctx, int devIdx, char *err, size_t errlen)
 {
     std::string e;
     char b[512];
@@ -1055,11 +1088,9 @@ static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
     }
 
     // marker for the BAR1 scan fallback
-    uint8_t magic[64];
-    std::memset(magic, 0, sizeof(magic));
-    std::snprintf((char *)magic, sizeof(magic), "BARLINK-SM86-%08x%08x",
+    std::snprintf((char *)P.magic, sizeof(P.magic), "BARLINK-SM86-%08x%08x",
                   (unsigned)getpid(), (unsigned)time(nullptr));
-    cuMemcpyHtoD(P.dptr, magic, sizeof(magic));
+    cuMemcpyHtoD(P.dptr, P.magic, sizeof(P.magic));
     cuCtxSynchronize();
 
     // 2. dma-buf export
@@ -1111,20 +1142,18 @@ static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
         setErr(err, errlen, b);
         return false;
     }
-    uint64_t barSize = (uint64_t)st.st_size;
-    uint64_t bar1Start = 0, bar1End = 0;
-    bool haveBar1Phys = readBarRange(bdf, 1, &bar1Start, &bar1End);
+    P.barSize = (uint64_t)st.st_size;
+    P.haveBar1Phys = readBarRange(bdf, 1, &P.bar1Start, &P.bar1End);
+    return true;
+}
 
-    // 3.+4. for every other device: HOLD as that device's PCI BDF, derive the
-    // BAR1 offset, mmap, register on the writer card.
-    for (int w = 0; w < ctx->ndev; ++w) {
-        if (w == devIdx) continue;
-        WritePath wp;
-        wp.writerIdx = w;
-        P.paths.push_back(wp);
-    }
-
-    // holder device: one open fd per pool is enough (handles are per-fd)
+// HOLD the pool's dma-buf as 'attachTo' and derive the pool's offset inside
+// its BAR1 aperture (sg table; marker-scan fallback). The map_attachment
+// triggers nv_dma_buf_map() and programs the BAR1 pages dynamically. v1:
+// one writer per pool, so this runs at most once per pool.
+static bool poolHold(Pool &P, const Bdf &attachTo, char *err, size_t errlen)
+{
+    char b[512];
     P.holderFd = open(DMABUF_HOLDER_DEVICE_PATH, O_RDWR | O_CLOEXEC);
     if (P.holderFd < 0) {
         int en = errno;
@@ -1144,135 +1173,158 @@ static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
         return false;
     }
 
-    for (size_t pi = 0; pi < P.paths.size(); ++pi) {
-        WritePath &wp = P.paths[pi];
-        const int wOrd = ctx->devices[wp.writerIdx];
+    const uint32_t kMaxEntries = 8192;
+    std::vector<dmabuf_holder_sg_entry> sg(kMaxEntries);
+    dmabuf_holder_hold harg;
+    std::memset(&harg, 0, sizeof(harg));
+    harg.dmabuf_fd   = P.dmabufFd;
+    harg.flags       = DMABUF_HOLDER_F_BDF_VALID;
+    harg.pci_domain  = attachTo.domain;
+    harg.pci_bus     = (uint8_t)attachTo.bus;
+    harg.pci_slot    = (uint8_t)attachTo.slot;
+    harg.pci_func    = (uint8_t)attachTo.func;
+    harg.max_entries = kMaxEntries;
+    harg.entries     = (uint64_t)(uintptr_t)sg.data();
+    if (ioctl(P.holderFd, DMABUF_HOLDER_IOC_HOLD, &harg) != 0) {
+        int en = errno;
+        std::snprintf(b, sizeof(b),
+            "DMABUF_HOLDER_IOC_HOLD (attach as %04x:%02x:%02x.%u): %s. "
+            "ENOTSUPP/524 = exporter rejected the attach (patched driver "
+            "+ BarlinkPeerBar1=1 both required).",
+            attachTo.domain, attachTo.bus, attachTo.slot, attachTo.func,
+            std::strerror(en));
+        setErr(err, errlen, b);
+        return false;
+    }
+    P.holderHandle = harg.handle;
+    if (harg.nents < kMaxEntries) sg.resize(harg.nents);
+
+    // BAR1 offset from the sg table (fallback: marker scan)
+    uint64_t barOff = (uint64_t)-1;
+    size_t covered = 0;
+    if (P.haveBar1Phys && !sg.empty()) {
+        uint64_t prevEnd = 0;
+        bool contiguous = true;
+        for (size_t i = 0; i < sg.size(); ++i) {
+            uint64_t a = sg[i].dma_address;
+            uint64_t l = sg[i].dma_len;
+            if (a < P.bar1Start || a > P.bar1End || a + l - 1 > P.bar1End) {
+                contiguous = false; break;
+            }
+            if (i == 0) { barOff = a - P.bar1Start; prevEnd = a + l; }
+            else if (a == prevEnd) { prevEnd = a + l; }
+            else { contiguous = false; break; }
+            covered += (size_t)l;
+        }
+        if (!contiguous || covered < P.size)
+            barOff = (uint64_t)-1;
+    }
+    if (barOff == (uint64_t)-1) {
+        barOff = barScan(P.barFd, P.barSize, P.magic, sizeof(P.magic));
+        if (barOff == (uint64_t)-1) {
+            setErr(err, errlen,
+                "pool not visible in BAR1 -- dynamic mapping did not "
+                "happen (patched driver? BarlinkPeerBar1=1? "
+                "dmabuf_holder.ko? CAP_SYS_ADMIN?)");
+            return false;
+        }
+    }
+    P.barOff = barOff;
+    return true;
+}
+
+// mmap the owner pool's BAR1 window for one writer device and register it
+// there (cudaHostRegister IoMemory -> the ONE cap-gated call of every
+// setup path) -> WritePath appended to the owner pool.
+static bool poolWriterPath(blCtx *ctx, int ownerIdx, int writerIdx,
+                           char *err, size_t errlen)
+{
+    char b[512];
+    Pool &P = ctx->pools[ownerIdx];
+    const int wOrd = ctx->devices[writerIdx];
+    WritePath wp;
+    wp.writerIdx = writerIdx;
+
+    const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    uint64_t mapOff = P.barOff & ~(uint64_t)(pageSize - 1);
+    uint64_t delta  = P.barOff - mapOff;
+    size_t mapLen = (size_t)((delta + P.size + pageSize - 1) / pageSize * pageSize);
+    if (mapOff + mapLen > P.barSize) mapLen = (size_t)(P.barSize - mapOff);
+    wp.map = mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED,
+                  P.barFd, (off_t)mapOff);
+    if (wp.map == MAP_FAILED) {
+        wp.map = nullptr;
+        std::snprintf(b, sizeof(b), "mmap(BAR1): %s", std::strerror(errno));
+        setErr(err, errlen, b);
+        return false;
+    }
+    wp.mapLen = mapLen;
+
+    cudaError_t ce = cudaSetDevice(wOrd);
+    if (ce != cudaSuccess) {
+        std::snprintf(b, sizeof(b), "cudaSetDevice(writer %d): %s",
+                      wOrd, cudaGetErrorString(ce));
+        setErr(err, errlen, b);
+        return false;
+    }
+    ce = cudaHostRegister(wp.map, mapLen, cudaHostRegisterIoMemory);
+    if (ce != cudaSuccess) {
+        std::snprintf(b, sizeof(b),
+            "cudaHostRegister(IoMemory) on device %d failed: %s -- the "
+            "BAR1 guard is not relaxed (patched driver + "
+            "BarlinkPeerBar1=1 required)", wOrd, cudaGetErrorString(ce));
+        setErr(err, errlen, b);
+        return false;
+    }
+    wp.registered = true;
+    ce = cudaHostGetDevicePointer(&wp.devPtr, wp.map, 0);
+    if (ce != cudaSuccess) {
+        std::snprintf(b, sizeof(b), "cudaHostGetDevicePointer: %s",
+                      cudaGetErrorString(ce));
+        setErr(err, errlen, b);
+        return false;
+    }
+    wp.devPtr = (uint8_t *)wp.devPtr + delta;
+    P.paths.push_back(wp);
+    return true;
+}
+
+static bool setupPool(blCtx *ctx, int devIdx, char *err, size_t errlen)
+{
+    if (!poolLocalSetup(ctx, devIdx, err, errlen)) return false;
+    Pool &P = ctx->pools[devIdx];
+    const int ord = ctx->devices[devIdx];
+
+    // 3.+4. for every other device: HOLD as that device's PCI BDF (v1: one
+    // writer, so the single HOLD derives the BAR1 offset), then mmap +
+    // register the window on the writer card.
+    for (int w = 0; w < ctx->ndev; ++w) {
+        if (w == devIdx) continue;
         char wBus[64] = {0};
-        if (cudaDeviceGetPCIBusId(wBus, sizeof(wBus), wOrd) != cudaSuccess) {
-            setErr(err, errlen, "cudaDeviceGetPCIBusId(writer) failed");
+        if (cudaDeviceGetPCIBusId(wBus, sizeof(wBus), ctx->devices[w])
+                != cudaSuccess) {
+            setErr(err, errlen, "setupPool: cudaDeviceGetPCIBusId(writer) failed");
             return false;
         }
         Bdf attachTo = parseBdf(lower(wBus).c_str());
         if (!attachTo.valid) {
-            setErr(err, errlen, "cannot parse writer BDF");
+            setErr(err, errlen, "setupPool: cannot parse writer BDF");
             return false;
         }
-
-        // HOLD: dma_buf_attach + dma_buf_map_attachment as the writer's PCI
-        // device -> nv_dma_buf_map() programs the BAR1 pages dynamically.
-        const uint32_t kMaxEntries = 8192;
-        std::vector<dmabuf_holder_sg_entry> sg(kMaxEntries);
-        dmabuf_holder_hold harg;
-        std::memset(&harg, 0, sizeof(harg));
-        harg.dmabuf_fd   = P.dmabufFd;
-        harg.flags       = DMABUF_HOLDER_F_BDF_VALID;
-        harg.pci_domain  = attachTo.domain;
-        harg.pci_bus     = (uint8_t)attachTo.bus;
-        harg.pci_slot    = (uint8_t)attachTo.slot;
-        harg.pci_func    = (uint8_t)attachTo.func;
-        harg.max_entries = kMaxEntries;
-        harg.entries     = (uint64_t)(uintptr_t)sg.data();
-        if (ioctl(P.holderFd, DMABUF_HOLDER_IOC_HOLD, &harg) != 0) {
-            int en = errno;
-            std::snprintf(b, sizeof(b),
-                "DMABUF_HOLDER_IOC_HOLD (pool dev %d, writer %d): %s. "
-                "ENOTSUPP/524 = exporter rejected the attach (patched driver "
-                "+ BarlinkPeerBar1=1 both required).",
-                ord, wOrd, std::strerror(en));
-            setErr(err, errlen, b);
+        if (P.holderHandle == 0 && !poolHold(P, attachTo, err, errlen))
             return false;
-        }
-        // one attachment per pool (v1: exactly one writer); the sg-derived
-        // offset describes the BAR1 window of this pool
-        if (P.holderHandle == 0) {
-            P.holderHandle = harg.handle;
-            if (harg.nents < kMaxEntries) sg.resize(harg.nents);
-
-            // BAR1 offset from the sg table (fallback: marker scan)
-            uint64_t barOff = (uint64_t)-1;
-            size_t covered = 0;
-            if (haveBar1Phys && !sg.empty()) {
-                uint64_t prevEnd = 0;
-                bool contiguous = true;
-                for (size_t i = 0; i < sg.size(); ++i) {
-                    uint64_t a = sg[i].dma_address;
-                    uint64_t l = sg[i].dma_len;
-                    if (a < bar1Start || a > bar1End || a + l - 1 > bar1End) {
-                        contiguous = false; break;
-                    }
-                    if (i == 0) { barOff = a - bar1Start; prevEnd = a + l; }
-                    else if (a == prevEnd) { prevEnd = a + l; }
-                    else { contiguous = false; break; }
-                    covered += (size_t)l;
-                }
-                if (!contiguous || covered < P.size)
-                    barOff = (uint64_t)-1;
-            }
-            if (barOff == (uint64_t)-1) {
-                barOff = barScan(P.barFd, barSize, magic, sizeof(magic));
-                if (barOff == (uint64_t)-1) {
-                    setErr(err, errlen,
-                        "pool not visible in BAR1 -- dynamic mapping did not "
-                        "happen (patched driver? BarlinkPeerBar1=1? "
-                        "dmabuf_holder.ko? CAP_SYS_ADMIN?)");
-                    return false;
-                }
-            }
-            P.barOff = barOff;
-        }
-
-        // private mmap for this writer + register on the writer card
-        const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-        uint64_t mapOff = P.barOff & ~(uint64_t)(pageSize - 1);
-        uint64_t delta  = P.barOff - mapOff;
-        size_t mapLen = (size_t)((delta + P.size + pageSize - 1) / pageSize * pageSize);
-        if (mapOff + mapLen > barSize) mapLen = (size_t)(barSize - mapOff);
-        wp.map = mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED,
-                      P.barFd, (off_t)mapOff);
-        if (wp.map == MAP_FAILED) {
-            wp.map = nullptr;
-            std::snprintf(b, sizeof(b), "mmap(BAR1): %s", std::strerror(errno));
-            setErr(err, errlen, b);
+        if (!poolWriterPath(ctx, devIdx, w, err, errlen))
             return false;
-        }
-        wp.mapLen = mapLen;
-
-        ce = cudaSetDevice(wOrd);
-        if (ce != cudaSuccess) {
-            std::snprintf(b, sizeof(b), "cudaSetDevice(writer %d): %s",
-                          wOrd, cudaGetErrorString(ce));
-            setErr(err, errlen, b);
-            return false;
-        }
-        ce = cudaHostRegister(wp.map, mapLen, cudaHostRegisterIoMemory);
-        if (ce != cudaSuccess) {
-            std::snprintf(b, sizeof(b),
-                "cudaHostRegister(IoMemory) on device %d failed: %s -- the "
-                "BAR1 guard is not relaxed (patched driver + "
-                "BarlinkPeerBar1=1 required)", wOrd, cudaGetErrorString(ce));
-            setErr(err, errlen, b);
-            return false;
-        }
-        wp.registered = true;
-        ce = cudaHostGetDevicePointer(&wp.devPtr, wp.map, 0);
-        if (ce != cudaSuccess) {
-            std::snprintf(b, sizeof(b), "cudaHostGetDevicePointer: %s",
-                          cudaGetErrorString(ce));
-            setErr(err, errlen, b);
-            return false;
-        }
-        wp.devPtr = (uint8_t *)wp.devPtr + delta;
     }
 
     // zero the flag region on the owner card (local memset; no traffic yet)
-    ce = cudaSetDevice(ord);
+    cudaError_t ce = cudaSetDevice(ord);
     if (ce != cudaSuccess ||
-        cudaMemset((void *)(P.dptr + flagOff(P, 0)), 0,
+        cudaMemset((void *)(P.dptr + P.size - BL_FLAG_REGION), 0,
                    BL_FLAG_REGION) != cudaSuccess) {
         setErr(err, errlen, "setupPool: flag-region memset failed");
         return false;
     }
-
     return true;
 }
 
@@ -1300,12 +1352,15 @@ static void teardownPool(blCtx *ctx, int devIdx)
     if (P.dmabufFd >= 0) { close(P.dmabufFd); P.dmabufFd = -1; }
     nvExportClose(P.nvx);
     if (P.barFd >= 0) { close(P.barFd); P.barFd = -1; }
-    if (P.dptr) {
+    // peer-mode pseudo-pools have no allocation of their own (dptr shadows
+    // the local pool for offset math -- never unmap it twice)
+    if (P.dptr && P.memHandle) {
         cudaSetDevice(ctx->devices[devIdx]);
         cuMemUnmap(P.dptr, P.size);
         cuMemAddressFree(P.dptr, P.size);
         cuMemRelease(P.memHandle);
         P.dptr = 0;
+        P.memHandle = 0;
     }
 }
 
@@ -1436,7 +1491,10 @@ static int copyPayload(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr,
     {
         std::lock_guard<std::mutex> lk(ctx->seqMu);
         seq = ++ctx->dirSeq[srcIdx];
-        ctx->lastIncoming[dstIdx] = seq;
+        // Copies landing in MY pool are issued by the peer process; under
+        // the SPMD discipline its outgoing counter mirrors mine step for
+        // step, so my outgoing seq IS my incoming seq.
+        ctx->lastIncoming[ctx->peerMode ? ctx->myRank : dstIdx] = seq;
     }
 
     // flag slot of this direction: BAR view (writer) and local VMM view
@@ -1469,21 +1527,28 @@ static int copyPayload(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr,
 
 // enqueue the reader-side wait on dstStream: any later work queued there is
 // ordered after the payload. Fully async -- no host sync.
-static int enqueueFlagWait(blCtx *ctx, int dstIdx,
-                           unsigned long long *flagLocal, uint64_t seq,
-                           void *dstStream, char *err, size_t errlen)
+static int enqueueFlagWaitOrd(blCtx *ctx, int ord,
+                              unsigned long long *flag, uint64_t seq,
+                              void *dstStream, char *err, size_t errlen)
 {
-    const int dstOrd = ctx->devices[dstIdx];
-    if (cudaSetDevice(dstOrd) != cudaSuccess) {
+    if (cudaSetDevice(ord) != cudaSuccess) {
         setErr(err, errlen, "enqueueFlagWait: cudaSetDevice failed");
         return -1;
     }
-    k_flag_wait<<<1, 32, 0, (cudaStream_t)dstStream>>>(flagLocal, seq);
+    k_flag_wait<<<1, 32, 0, (cudaStream_t)dstStream>>>(flag, seq);
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "enqueueFlagWait: flag-wait launch failed");
         return -1;
     }
     return 0;
+}
+
+static int enqueueFlagWait(blCtx *ctx, int dstIdx,
+                           unsigned long long *flagLocal, uint64_t seq,
+                           void *dstStream, char *err, size_t errlen)
+{
+    return enqueueFlagWaitOrd(ctx, ctx->devices[dstIdx], flagLocal, seq,
+                              dstStream, err, errlen);
 }
 
 extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
@@ -1496,6 +1561,62 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
         setErr(err, errlen, "bl_copy_: bad argument (src and dst must be "
                             "different pool devices, size a multiple of 16)");
         return -1;
+    }
+    if (ctx->peerMode) {
+        // Peer-mode copy, all on MY device and MY stream (dstStream is the
+        // same stream in peer mode). See the flag-slot protocol note above
+        // for the arm handshake and the ordering argument.
+        const int me = ctx->myRank, peer = 1 - me;
+        Pool &myP = ctx->pools[me];
+        Pool &peerP = ctx->pools[peer];
+        void *bar = pathDevPtr(ctx, peer, me);
+        if (!bar) {
+            setErr(err, errlen, "bl_copy_: no BAR1 write path");
+            return -1;
+        }
+        uintptr_t base = (uintptr_t)myP.dptr;
+        if ((uintptr_t)dstPtr < base ||
+            (uintptr_t)dstPtr + bytes > base + peerP.usableSize) {
+            setErr(err, errlen, "bl_copy_: dst pointer outside the pool");
+            return -1;
+        }
+        uint8_t *dstBar = (uint8_t *)bar + ((uintptr_t)dstPtr - base);
+
+        uint64_t seq;
+        {
+            std::lock_guard<std::mutex> lk(ctx->seqMu);
+            seq = ++ctx->dirSeq[me];
+            ctx->lastIncoming[me] = seq;
+        }
+        const int myOrd = ctx->devices[me];
+        if (cudaSetDevice(myOrd) != cudaSuccess) {
+            setErr(err, errlen, "bl_copy_: cudaSetDevice failed");
+            return -1;
+        }
+        cudaStream_t s = (cudaStream_t)srcStream;
+        // 1. arm: ordered after the caller's local fills of MY dst
+        k_mark<<<1, 1, 0, s>>>(
+            (unsigned long long *)(uintptr_t)(
+                myP.dptr + flagOff(myP, peer) + 8), seq);
+        // 2. wait for the peer's arm through my BAR view of its pool
+        k_flag_wait<<<1, 32, 0, s>>>(
+            (unsigned long long *)((uint8_t *)bar + flagOff(peerP, me) + 8),
+            seq);
+        // 3. payload + completion mark
+        size_t n4 = bytes / 16;
+        k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+            (const uint4 *)srcPtr, (uint4 *)dstBar, n4);
+        k_mark<<<1, 1, 0, s>>>(
+            (unsigned long long *)((uint8_t *)bar + flagOff(peerP, me)), seq);
+        // 4. my completion wait (local flag, written by the peer)
+        k_flag_wait<<<1, 32, 0, s>>>(
+            (unsigned long long *)(uintptr_t)(
+                myP.dptr + flagOff(myP, peer)), seq);
+        if (cudaGetLastError() != cudaSuccess) {
+            setErr(err, errlen, "bl_copy_: kernel launch failed");
+            return -1;
+        }
+        return 0;
     }
     unsigned long long *flagLocal = nullptr;
     uint64_t seq = 0;
@@ -1595,10 +1716,509 @@ out:
     return rc;
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process (SPMD peer) mode: one process per GPU, rank = device index.
+//
+// Discipline (MPI-symmetric-heap style): both ranks call IDENTICAL
+// sequences of bl_* functions with identical sizes. There is NO runtime
+// control channel -- bl_init_peer performs a one-time rendezvous over a
+// unix socket (phase 1: {BDF, poolBytes}; phase 2: {BAR1 offset}), after
+// which the processes never talk again. Every synchronization primitive is
+// the marker flag: flags live in each pool's 4 KiB tail, one 256-byte slot
+// per WRITER (slot index = writer rank), so the two ranks agree on slots
+// by construction.
+//
+// Memory layout (poolBytes equal on both ranks): user tensors in
+// [0, scratchBase); scratchBase = size/2 rounded down to the 2 MiB alloc
+// alignment. The scratch zone [scratchBase, size - flagTail) is the
+// cross-process exchange area (allreduce scratch, verify zone); matching
+// offsets land there on both sides by symmetric allocation.
+// ---------------------------------------------------------------------------
+
+struct BlPeerHello { char bdf[20]; uint64_t poolBytes; };
+struct BlPeerBar  { uint64_t barOff; };
+
+static bool peerWriteAll(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len) {
+        ssize_t w = write(fd, p, len);
+        if (w <= 0) return false;
+        p += w; len -= (size_t)w;
+    }
+    return true;
+}
+
+static bool peerReadAll(int fd, void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (len) {
+        ssize_t r = read(fd, p, len);
+        if (r <= 0) return false;
+        p += r; len -= (size_t)r;
+    }
+    return true;
+}
+
+// write-then-read; the socket buffer absorbs both directions, no deadlock
+static bool peerXchg(int fd, const void *out, size_t outLen,
+                     void *in, size_t inLen, char *err, size_t errlen)
+{
+    if (!peerWriteAll(fd, out, outLen) || !peerReadAll(fd, in, inLen)) {
+        setErr(err, errlen,
+               std::string("peer socket exchange failed: ") +
+               std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+// '@name' selects the abstract namespace; anything else is a filesystem
+// path (rank 0 unlinks it before bind and after accept)
+static int peerSockPath(struct sockaddr_un *sa, const char *sockPath)
+{
+    std::memset(sa, 0, sizeof(*sa));
+    sa->sun_family = AF_UNIX;
+    if (sockPath[0] == '@') {
+        size_t n = std::strlen(sockPath + 1);
+        if (n == 0 || n >= sizeof(sa->sun_path) - 1) return -1;
+        sa->sun_path[0] = 0;
+        std::memcpy(sa->sun_path + 1, sockPath + 1, n);
+        return (int)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+    }
+    if (std::strlen(sockPath) >= sizeof(sa->sun_path)) return -1;
+    std::strncpy(sa->sun_path, sockPath, sizeof(sa->sun_path) - 1);
+    return (int)(offsetof(struct sockaddr_un, sun_path) +
+                 1 + std::strlen(sockPath));
+}
+
+static bool peerConnect(const char *sockPath, int rank, int *fdOut,
+                        char *err, size_t errlen)
+{
+    char b[256];
+    struct sockaddr_un sa;
+    int slen = peerSockPath(&sa, sockPath);
+    if (slen < 0) {
+        setErr(err, errlen, "peerConnect: socket path too long");
+        return false;
+    }
+    bool fsPath = sockPath[0] != '@';
+    if (rank == 0) {
+        if (fsPath) unlink(sockPath);        // drop a stale bind
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0 || bind(fd, (struct sockaddr *)&sa, (socklen_t)slen) != 0 ||
+            listen(fd, 1) != 0) {
+            std::snprintf(b, sizeof(b), "peer rank 0 bind/listen(%s): %s",
+                          sockPath, std::strerror(errno));
+            setErr(err, errlen, b);
+            if (fd >= 0) close(fd);
+            return false;
+        }
+        int c = accept(fd, nullptr, nullptr);
+        if (c < 0) {
+            std::snprintf(b, sizeof(b), "peer rank 0 accept: %s",
+                          std::strerror(errno));
+            setErr(err, errlen, b);
+            close(fd);
+            return false;
+        }
+        close(fd);                           // rendezvous done
+        if (fsPath) unlink(sockPath);
+        *fdOut = c;
+    } else {
+        int c = -1;
+        for (int i = 0; i < 200 && c < 0; ++i) {   // rank 0 may be slow
+            c = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (c < 0) break;
+            if (connect(c, (struct sockaddr *)&sa, (socklen_t)slen) != 0) {
+                close(c);
+                c = -1;
+                usleep(50 * 1000);
+            }
+        }
+        if (c < 0) {
+            std::snprintf(b, sizeof(b),
+                          "peer rank 1 connect(%s) failed: %s -- is rank 0 "
+                          "running with the same socket path?", sockPath,
+                          std::strerror(errno));
+            setErr(err, errlen, b);
+            return false;
+        }
+        *fdOut = c;
+    }
+    return true;
+}
+
+extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
+                            const char *sockPath, int rank,
+                            char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!out || !sockPath || (rank != 0 && rank != 1)) {
+        setErr(err, errlen, "bl_init_peer: rank must be 0 or 1");
+        return -1;
+    }
+    if (poolBytes < (8ull << 20)) {
+        setErr(err, errlen,
+               "bl_init_peer: pool must be >= 8 MiB (half of it is the "
+               "cross-process scratch zone)");
+        return -1;
+    }
+    int nd = 0;
+    if (cudaGetDeviceCount(&nd) != cudaSuccess || device < 0 || device >= nd) {
+        setErr(err, errlen, "bl_init_peer: device ordinal out of range");
+        return -1;
+    }
+
+    blCtx *ctx = new blCtx();
+    ctx->ndev = 2;
+    ctx->peerMode = true;
+    ctx->myRank = rank;
+    ctx->poolBytes = poolBytes;
+    ctx->devices[rank] = device;
+    ctx->devices[1 - rank] = -1;   // peer ordinal: unknown, never used locally
+    const int me = rank, peer = 1 - rank;
+
+    // Phase 0+1: rendezvous, exchange {my GPU BDF, poolBytes}
+    int fd = -1;
+    if (!peerConnect(sockPath, rank, &fd, err, errlen)) { delete ctx; return -1; }
+    BlPeerHello mineHello, peerHello;
+    std::memset(&mineHello, 0, sizeof(mineHello));
+    {
+        char busId[64] = {0};
+        if (cudaDeviceGetPCIBusId(busId, sizeof(busId), device)
+                != cudaSuccess) {
+            setErr(err, errlen, "bl_init_peer: cudaDeviceGetPCIBusId failed");
+            close(fd); delete ctx; return -1;
+        }
+        std::string s = lower(busId);
+        std::strncpy(mineHello.bdf, s.c_str(), sizeof(mineHello.bdf) - 1);
+    }
+    mineHello.poolBytes = poolBytes;
+    if (!peerXchg(fd, &mineHello, sizeof(mineHello),
+                  &peerHello, sizeof(peerHello), err, errlen)) {
+        close(fd); delete ctx; return -1;
+    }
+    if (peerHello.poolBytes != poolBytes) {
+        setErr(err, errlen,
+               "bl_init_peer: poolBytes mismatch between ranks (symmetric "
+               "SPMD requires equal pools)");
+        close(fd); delete ctx; return -1;
+    }
+    Bdf peerBdf = parseBdf(peerHello.bdf);
+    if (!peerBdf.valid) {
+        setErr(err, errlen, "bl_init_peer: peer sent an unparseable BDF");
+        close(fd); delete ctx; return -1;
+    }
+
+    // Local setup: my VMM pool + dma-buf export + my BAR1 aperture, then
+    // HOLD my fd as the PEER's PCI device (the peer GPU is the device that
+    // will actually write my BAR1) and derive my BAR1 offset.
+    if (!poolLocalSetup(ctx, me, err, errlen)) {
+        close(fd); delete ctx; return -1;
+    }
+    Pool &myP = ctx->pools[me];
+    if (!poolHold(myP, peerBdf, err, errlen)) {
+        close(fd); delete ctx; return -1;
+    }
+
+    // Peer-mode memory layout: user tensors below scratchBase, exchange
+    // scratch in [scratchBase, size - flagTail). Both ranks compute the
+    // same value because poolBytes (hence size) is equal.
+    ctx->scratchBase = (myP.size / 2) & ~(kAllocAlign - 1);
+    myP.usableSize = ctx->scratchBase;
+
+    // zero my flag tail BEFORE the peer can reach it (phase 2 below hands
+    // out my barOff, after which the peer may write into my pool)
+    if (cudaSetDevice(device) != cudaSuccess ||
+        cudaMemset((void *)(myP.dptr + myP.size - BL_FLAG_REGION), 0,
+                   BL_FLAG_REGION) != cudaSuccess) {
+        setErr(err, errlen, "bl_init_peer: flag-region memset failed");
+        close(fd); delete ctx; return -1;
+    }
+
+    // Phase 2: exchange my BAR1 offset
+    BlPeerBar mineBar, peerBar;
+    mineBar.barOff = myP.barOff;
+    if (!peerXchg(fd, &mineBar, sizeof(mineBar),
+                  &peerBar, sizeof(peerBar), err, errlen)) {
+        close(fd); delete ctx; return -1;
+    }
+    close(fd);
+
+    // Remote setup: mmap + register the PEER's BAR1 window on MY device
+    // (the one cap-gated call of this path). pools[peer] is a pseudo-entry:
+    // no local VA exists for the peer pool; dptr/size/usableSize shadow MY
+    // pool so offset(ptr) = ptr - dptr keeps working in the copy path.
+    Pool &peerP = ctx->pools[peer];
+    peerP.devIdx = peer;
+    peerP.size = myP.size;
+    peerP.usableSize = myP.usableSize;
+    peerP.dptr = myP.dptr;                 // offset math only, never dereferenced
+    peerP.barOff = peerBar.barOff;
+    {
+        std::string peerBarPath = std::string("/sys/bus/pci/devices/") +
+                                  peerHello.bdf + "/resource1_wc";
+        peerP.barFd = open(peerBarPath.c_str(), O_RDWR | O_SYNC);
+        if (peerP.barFd < 0) {
+            char b[256];
+            std::snprintf(b, sizeof(b), "bl_init_peer: open(%s): %s",
+                          peerBarPath.c_str(), std::strerror(errno));
+            setErr(err, errlen, b);
+            delete ctx; return -1;
+        }
+        struct stat st;
+        if (fstat(peerP.barFd, &st) != 0) {
+            setErr(err, errlen, "bl_init_peer: fstat(peer BAR1) failed");
+            delete ctx; return -1;
+        }
+        peerP.barSize = (uint64_t)st.st_size;
+    }
+    if (!poolWriterPath(ctx, peer, me, err, errlen)) {   // writer = me
+        delete ctx; return -1;
+    }
+
+    // caps were only needed for the cudaHostRegister above
+    bl_drop_caps();
+    *out = ctx;
+    return 0;
+}
+
+// Drop all capabilities (ambient clear + capset). Exported so the binding
+// can share it between the single-process and peer init paths.
+extern "C" void bl_drop_caps(void)
+{
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {};
+    syscall(SYS_capset, &hdr, data);
+}
+
+extern "C" int bl_is_peer(const blCtx *ctx)
+{
+    return ctx && ctx->peerMode;
+}
+
+extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
+                                 size_t bytes, int dtype, void *stream,
+                                 char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode || bytes == 0 || bytes % 16 != 0) {
+        setErr(err, errlen,
+               "bl_allreduce_peer: bad argument (size a multiple of 16)");
+        return -1;
+    }
+    if (dtype < BL_DTYPE_U8 || dtype > BL_DTYPE_FP8E5M2) {
+        setErr(err, errlen, "bl_allreduce_peer: unsupported dtype enum");
+        return -1;
+    }
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+    uintptr_t base = (uintptr_t)myP.dptr;
+    uintptr_t oa = (uintptr_t)aPtr - base;
+    uintptr_t ob = (uintptr_t)bPtr - base;
+    if (oa % 16 || ob % 16 ||
+        oa + bytes > myP.usableSize || ob + bytes > myP.usableSize) {
+        setErr(err, errlen,
+               "bl_allreduce_peer: tensors must live in the user half of my "
+               "pool, [0, scratchBase)");
+        return -1;
+    }
+    uintptr_t omax = oa > ob ? oa : ob;
+    if (ctx->scratchBase + omax + bytes > myP.size - BL_FLAG_REGION) {
+        setErr(err, errlen,
+               "bl_allreduce_peer: tensor does not fit in the scratch zone");
+        return -1;
+    }
+    void *bar = pathDevPtr(ctx, peer, me);
+    if (!bar) {
+        setErr(err, errlen, "bl_allreduce_peer: no BAR1 write path");
+        return -1;
+    }
+
+    // ONE seq per allreduce per rank. Both payloads go out BEFORE the
+    // single mark: stream order lets one fence + one flag cover both
+    // writes. The peer runs the identical sequence concurrently, so the
+    // two directions overlap on the wire (the same overlap trick as
+    // single-process mode).
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        seq = ++ctx->dirSeq[me];
+        ctx->lastIncoming[me] = seq;
+    }
+
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_peer: cudaSetDevice failed");
+        return -1;
+    }
+    const size_t n4 = bytes / 16;
+    uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
+    cudaStream_t s = (cudaStream_t)stream;
+
+    // arm handshake (see the flag-slot protocol note): my scratch zone is
+    // ready to receive -- ordered after my previous-step local add, and
+    // visible to the peer through its BAR view of my pool
+    k_mark<<<1, 1, 0, s>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, peer) + 8), seq);
+    k_flag_wait<<<1, 32, 0, s>>>(
+        (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
+        seq);
+
+    // BOTH payloads before the single completion mark: stream order lets one
+    // fence + one flag cover both writes. The peer runs the identical
+    // sequence concurrently, so the two directions overlap on the wire.
+    k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+        (const uint4 *)bPtr, (uint4 *)(peerScratch + ob), n4);
+    k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+        (const uint4 *)aPtr, (uint4 *)(peerScratch + oa), n4);
+    k_mark<<<1, 1, 0, s>>>(
+        (unsigned long long *)((uint8_t *)bar +
+                               flagOff(ctx->pools[peer], me)), seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_peer: kernel launch failed");
+        return -1;
+    }
+
+    // reader wait on MY completion flag (slot of the peer as writer; the
+    // peer's mark wrote the same seq into it). Orders my stream after the
+    // PEER's payloads landing in MY scratch zone.
+    unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, peer));
+    k_flag_wait<<<1, 32, 0, s>>>(myFlag, seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_peer: flag-wait launch failed");
+        return -1;
+    }
+
+    // local adds against MY scratch copy of the PEER's original values
+    uint4 *scrA = (uint4 *)(uintptr_t)(myP.dptr + ctx->scratchBase + oa);
+    uint4 *scrB = (uint4 *)(uintptr_t)(myP.dptr + ctx->scratchBase + ob);
+    if (launchAdd(dtype, (uint4 *)aPtr, (const uint4 *)scrA, n4,
+                  gridBlocks(n4, myOrd), s) != 0 ||
+        launchAdd(dtype, (uint4 *)bPtr, (const uint4 *)scrB, n4,
+                  gridBlocks(n4, myOrd), s) != 0) {
+        setErr(err, errlen, "bl_allreduce_peer: bad dtype (internal)");
+        return -1;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_peer: add kernel launch failed");
+        return -1;
+    }
+    // v1: conservative drain. The scratch zone is shared with verify/copy
+    // traffic and the free would need cross-process agreement.
+    cudaDeviceSynchronize();
+    return 0;
+}
+
+extern "C" uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode) return ~0ull;
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+
+    size_t win = myP.size - BL_FLAG_REGION - ctx->scratchBase;
+    if (win > (4ull << 20)) win = 4ull << 20;
+    win &= ~(size_t)15;
+    const size_t off = ctx->scratchBase;
+    const unsigned seed = 0xB1;
+
+    void *bar = pathDevPtr(ctx, peer, me);
+    if (!bar) {
+        setErr(err, errlen, "bl_verify_peer: no BAR1 write path");
+        return ~0ull;
+    }
+
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        seq = ++ctx->dirSeq[me];
+        ctx->lastIncoming[me] = seq;
+    }
+
+    if (cudaSetDevice(myOrd) != cudaSuccess) return ~0ull;
+    const size_t n4 = win / 16;
+    // both ranks write the SAME pattern into the peer's scratch zone, so
+    // the two directions cannot conflict. Arm handshake first: the peer
+    // must be done reading its scratch zone from the previous step.
+    k_mark<<<1, 1>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, peer) + 8), seq);
+    k_flag_wait<<<1, 32>>>(
+        (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
+        seq);
+    k_pattern<<<gridBlocks(n4, myOrd), 256>>>(
+        (uint4 *)((uint8_t *)bar + off), n4, seed);
+    k_mark<<<1, 1>>>(
+        (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me)),
+        seq);
+    if (cudaGetLastError() != cudaSuccess) return ~0ull;
+
+    // wait for the PEER's pattern to land in MY scratch zone
+    unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, peer));
+    k_flag_wait<<<1, 32>>>(myFlag, seq);
+    if (cudaGetLastError() != cudaSuccess) return ~0ull;
+
+    // verify MY local scratch zone through my own VMM pointer
+    BlVerifyOut init = { 0, ~0ull }, res;
+    BlVerifyOut *dres = nullptr;
+    if (cudaMalloc(&dres, sizeof(*dres)) != cudaSuccess) return ~0ull;
+    if (cudaMemcpy(dres, &init, sizeof(init), cudaMemcpyHostToDevice)
+            != cudaSuccess) return ~0ull;
+    k_verify<<<gridBlocks(n4, myOrd), 256>>>(
+        (const uint4 *)(uintptr_t)(myP.dptr + off), n4, seed, dres);
+    if (cudaGetLastError() != cudaSuccess) return ~0ull;
+    if (cudaDeviceSynchronize() != cudaSuccess) return ~0ull;
+    if (cudaMemcpy(&res, dres, sizeof(res), cudaMemcpyDeviceToHost)
+            != cudaSuccess) return ~0ull;
+    cudaFree(dres);
+
+    // Informational secondary proof: read MY OWN pattern back through the
+    // BAR-view pointer (a GPU-side read of the peer BAR aperture with
+    // ld.global.cv). Our protocol never polls BAR-view flags (the local
+    // flag tail is the ordered channel), but this confirms the BAR is
+    // readable from the GPU, which a BAR-polling design would rely on.
+    {
+        void *stage = nullptr;
+        bool barReadOk = false;
+        if (cudaMalloc(&stage, 64) == cudaSuccess) {
+            k_readback<<<1, 4>>>((const uint4 *)((uint8_t *)bar + off),
+                                 (uint4 *)stage, 4);
+            if (cudaGetLastError() == cudaSuccess &&
+                cudaDeviceSynchronize() == cudaSuccess) {
+                uint8_t got[64];
+                if (cudaMemcpy(got, stage, 64, cudaMemcpyDeviceToHost)
+                        == cudaSuccess) {
+                    barReadOk = true;
+                    for (int k = 0; k < 64 && barReadOk; ++k)
+                        barReadOk = got[k] == (uint8_t)(patVal(
+                            (uint64_t)k & ~(uint64_t)15, seed,
+                            (int)(((uint64_t)k & 15) >> 2)) >>
+                            (((int)k & 3) * 8));
+                }
+            }
+            cudaFree(stage);
+        }
+        std::printf("bl_verify_peer: rank %d: BAR-view readback: %s\n", me,
+                    barReadOk ? "OK" : "UNUSABLE (informational only)");
+    }
+
+    std::printf("bl_verify_peer: rank %d: peer -> me bad_bytes = %llu of %zu\n",
+                me, (unsigned long long)res.bad, win);
+    return res.bad;
+}
+
 extern "C" uint64_t bl_verify(blCtx *ctx, char *err, size_t errlen)
 {
     setErr(err, errlen, "");
     if (!ctx) return ~0ull;
+    if (ctx->peerMode) return bl_verify_peer(ctx, err, errlen);
     uint64_t totalBad = 0;
     const size_t win = ctx->poolBytes < (4ull << 20) ? ctx->poolBytes
                                                      : (4ull << 20);

@@ -125,6 +125,8 @@ torch_ext/
 │   └── binding.cpp           # torch/pybind thin layer
 ├── tests/test_basic.py       # verify/copy_/allreduce_ vs CPU refs + small GB/s
 ├── tests/test_dtypes.py      # copy_/allreduce_ across fp32/fp64/bf16/fp8/u8
+├── tests/test_peer.py        # cross-process SPMD: init_peer/copy_/allreduce_
+├── tests/run_peer.sh         # orchestrates the two peer ranks
 └── README.md
 ```
 
@@ -174,6 +176,55 @@ no cross-copy source-buffer reuse hazard: pool tensors are never freed, so
 an in-flight `copy_` can never observe its source reallocated.
 
 Not yet done: >2 devices (needs a per-writer attachment policy in
-dmabuf_holder), cross-process fd exchange, tensor `free` API,
+dmabuf_holder), tensor `free` API,
 non-u8 allreduce, stream-aware scratch free in `allreduce_` (host sync
 kept, see TODO in core.cu).
+
+## Cross-process (SPMD peer) mode
+
+One process per GPU (`rank = device index`), no runtime control channel —
+`bl_init_peer` does a one-time two-phase unix-socket rendezvous
+(phase 1: `{BDF, poolBytes}`; phase 2: `{BAR1 offset}`) and the processes
+never talk again. Both ranks must call **identical** `bl_*` sequences with
+identical sizes; allocations are symmetric by construction (bump allocator
++ same call sequence), so pool offsets match across processes.
+
+```python
+# rank r of 2, under tools/blrun with BL_SKIP_INIT=1:
+bl._C.init_peer(device=r, pool_mb=64, sock_path="/tmp/bl.sock", rank=r)
+x = bl.empty(4 << 20, device=r)
+y = bl.empty(4 << 20, device=r)
+bl.copy_(x, y)          # after BOTH ranks call: my x holds the peer's y
+bl.allreduce_(x, y)     # after BOTH ranks call: my x = my_x + peer_x (u8 wraps)
+bad = bl.verify()       # symmetric byte proof (dispatches to peer mode)
+```
+
+Python surface: `bl._C.init_peer(device, pool_mb=64, sock_path, rank)`.
+`empty`/`copy_`/`allreduce_`/`verify`/`readback` dispatch on the mode
+transparently. Peer mode reserves the upper pool half as a cross-process
+scratch zone (`pool_mb >= 8`); user tensors must fit in the lower half.
+
+Memory layout per pool (both ranks identical): user tensors in
+`[0, size/2)`, scratch/exchange zone in `[size/2, size - 4 KiB)`, flag
+tail in the last 4 KiB. Flag slots (256 B per direction):
+`+0` payload-completion marker (written by the writer through the BAR),
+`+8` **arm** marker (written LOCALLY by the owner, polled by the writer
+through its BAR view with `ld.global.cv`).
+
+The arm handshake closes the fill race inherent to every cross-process
+design: a local fill of a buffer is only ordered on the owner's stream, so
+without it the peer's remote write could land first and be overwritten.
+Per step, on each rank's single stream: arm store (ordered after the
+caller's fills) → poll the peer's arm via BAR view → payload + completion
+mark → poll the local completion flag. Arm stores precede arm waits on
+both sides, so this cannot deadlock.
+
+Run the peer test (orchestrates both ranks, propagates exit codes):
+
+```bash
+bash torch_ext/tests/run_peer.sh
+```
+
+`torch_ext/barlink_sm86/_bootstrap.py` honors `BL_SKIP_INIT=1`: skip the
+bootstrap's own `bl.init()` so each peer process initializes itself (and
+drops caps inside `init_peer`).

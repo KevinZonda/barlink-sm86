@@ -78,7 +78,40 @@ int  bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx, void *bPtr, int bIdx,
 // Byte proof over all device pairs: writes a pattern through each BAR1 path
 // and verifies it on the owner card through its own VMM pointer with
 // ld.global.cv. Returns total bad_bytes (0 = verified, ~0 = run failed).
+// In a peer-mode ctx this dispatches to the symmetric cross-process proof.
 uint64_t bl_verify(blCtx *ctx, char *err, size_t errlen);
+
+// Symmetric SPMD peer mode: ONE PROCESS PER GPU. rank = device index (0/1).
+// Both ranks must call IDENTICAL sequences of bl_* functions with identical
+// sizes (MPI-symmetric-heap discipline); there is NO runtime control
+// channel — bl_init_peer performs a one-time two-phase unix-socket
+// rendezvous (phase 1: BDF + poolBytes; phase 2: BAR1 offset), after which
+// the processes are independent. CAP_SYS_ADMIN is required only inside
+// init_peer (cudaHostRegister of the peer BAR); bl_drop_caps() is called on
+// success, like bl_init does implicitly in the binding.
+int  bl_init_peer(blCtx **out, int device, size_t poolBytes,
+                  const char *sockPath, int rank, char *err, size_t errlen);
+
+// Peer-mode allreduce: a and b are MY LOCAL pool tensors (same offsets on
+// both ranks by symmetric allocation). After both ranks call it: each
+// tensor holds my_value + peer_value elementwise (u8 wraps, see dtype
+// semantics of bl_allreduce_). Scratch lives in a fixed zone at
+// [scratchBase, size-flagTail); user tensors must fit below scratchBase.
+int  bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr, size_t bytes,
+                       int dtype, void *stream, char *err, size_t errlen);
+
+// Symmetric byte proof for peer mode: each rank writes a pattern into the
+// PEER pool's scratch zone through its BAR path and verifies its own local
+// scratch zone (written by the peer). Returns bad_bytes for the
+// peer->me direction (the peer's process reports the other direction).
+uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen);
+
+// Drop all capabilities (prctl ambient clear + capset). Called by the
+// binding after a successful init; harmless without privileges.
+void bl_drop_caps(void);
+
+// Nonzero when ctx was created by bl_init_peer.
+int  bl_is_peer(const blCtx *ctx);
 
 // Reliable host readback of a pool region that may have received inbound
 // PCIe writes: a kernel on the owner card reads with ld.global.cv into a

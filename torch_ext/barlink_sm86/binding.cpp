@@ -7,11 +7,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <linux/capability.h>
-#include <sys/prctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -23,22 +18,10 @@
 static blCtx *g_ctx = nullptr;
 static std::vector<int> g_devices;
 static int64_t g_pool_mb = 0;
+static bool  g_peer = false;      // peer (cross-process SPMD) mode
+static int   g_myRank = -1;
 
 #define BL_ERRBUF 1024
-
-// CAP_SYS_ADMIN (via tools/blrun) is needed only for the
-// cudaHostRegister(IoMemory) calls inside bl_init(). Drop every capability
-// the moment init succeeds; with blrun's no_new_privs they can never be
-// regained. Harmless when the process has no caps to begin with.
-static void dropCapsAfterInit()
-{
-    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-    struct __user_cap_header_struct hdr = {
-        _LINUX_CAPABILITY_VERSION_3, 0,
-    };
-    struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {};
-    syscall(SYS_capset, &hdr, data);
-}
 
 static void blCheck(int rc, char *errbuf)
 {
@@ -111,7 +94,43 @@ void init(std::vector<int64_t> devices, int64_t pool_mb)
     g_ctx = ctx;
     g_devices.assign(devs, devs + 2);
     g_pool_mb = pool_mb;
-    dropCapsAfterInit();
+    g_peer = false;
+    g_myRank = -1;
+    // caps were only needed for the cudaHostRegister calls inside bl_init
+    bl_drop_caps();
+}
+
+// Cross-process SPMD mode: this process owns exactly ONE GPU (rank = device
+// index). Both ranks must call identical bl_* sequences with identical
+// sizes; the only cross-process traffic is the rendezvous inside
+// bl_init_peer. Caps are dropped on success, as in init().
+void init_peer(int64_t device, int64_t pool_mb, std::string sock_path,
+               int64_t rank)
+{
+    TORCH_CHECK(!g_ctx,
+                "barlink_sm86: already initialized; restart the process");
+    TORCH_CHECK(rank == 0 || rank == 1,
+                "barlink_sm86 init_peer: rank must be 0 or 1");
+    TORCH_CHECK(pool_mb >= 8,
+                "barlink_sm86: peer mode reserves half the pool as "
+                "cross-process scratch (pool_mb >= 8)");
+    TORCH_CHECK(pool_mb <= 192,
+                "barlink_sm86: pool must fit the 256 MiB BAR1 aperture "
+                "(keep pool_mb <= 192)");
+
+    char err[BL_ERRBUF] = {0};
+    blCtx *ctx = nullptr;
+    blCheck(bl_init_peer(&ctx, (int)device, (size_t)pool_mb << 20,
+                         sock_path.c_str(), (int)rank, err, sizeof(err)), err);
+    g_ctx = ctx;
+    g_peer = true;
+    g_myRank = (int)rank;
+    // map MY device to MY rank so devIndexFor feeds the core the indices it
+    // indexes pools/flags with (a peer-mode process only ever sees its own
+    // device)
+    g_devices.assign(2, -1);
+    g_devices[g_myRank] = (int)device;
+    g_pool_mb = pool_mb;
 }
 
 void shutdown()
@@ -119,6 +138,8 @@ void shutdown()
     if (g_ctx) bl_shutdown(g_ctx);
     g_ctx = nullptr;
     g_pool_mb = 0;
+    g_peer = false;
+    g_myRank = -1;
     g_devices.clear();
 }
 
@@ -160,8 +181,6 @@ void copy_(at::Tensor dst, at::Tensor src)
     void *dstPtr = nullptr, *srcPtr = nullptr;
     checkPoolPtr(dst, &dstIdx, &dstPtr);
     checkPoolPtr(src, &srcIdx, &srcPtr);
-    TORCH_CHECK(dstIdx != srcIdx, "barlink_sm86 copy_: src and dst must live "
-                                  "on different pool devices");
     TORCH_CHECK(dst.scalar_type() == src.scalar_type(),
                 "barlink_sm86 copy_: dtype mismatch (",
                 dst.scalar_type(), " vs ", src.scalar_type(), ")");
@@ -170,6 +189,22 @@ void copy_(at::Tensor dst, at::Tensor src)
     size_t bytes = (size_t)dst.numel() * dst.element_size();
     TORCH_CHECK(bytes % 16 == 0,
                 "barlink_sm86 copy_: byte size must be a multiple of 16");
+
+    if (g_peer) {
+        // SPMD exchange: I write my src into the PEER pool at dst's offset;
+        // the peer writes into my pool concurrently. The flag wait lands on
+        // my stream and orders it after the peer's payload.
+        cudaStream_t s = at::cuda::getCurrentCUDAStream(
+            src.get_device()).stream();
+        c10::cuda::CUDAGuard guard(src.get_device());
+        char err[BL_ERRBUF] = {0};
+        blCheck(bl_copy_(g_ctx, dstPtr, 1 - g_myRank, srcPtr, g_myRank,
+                         bytes, (void *)s, (void *)s, err, sizeof(err)), err);
+        return;
+    }
+
+    TORCH_CHECK(dstIdx != srcIdx, "barlink_sm86 copy_: src and dst must live "
+                                  "on different pool devices");
 
     // current streams on the two devices; the marker-flag wait is queued
     // on the destination stream by bl_copy_
@@ -191,8 +226,6 @@ void allreduce_(at::Tensor a, at::Tensor b)
     void *aPtr = nullptr, *bPtr = nullptr;
     checkPoolPtr(a, &aIdx, &aPtr);
     checkPoolPtr(b, &bIdx, &bPtr);
-    TORCH_CHECK(aIdx != bIdx, "barlink_sm86 allreduce_: tensors must live on "
-                              "different pool devices");
     TORCH_CHECK(a.scalar_type() == b.scalar_type(),
                 "barlink_sm86 allreduce_: dtype mismatch");
     int dt = dtypeEnumFor(a.scalar_type());
@@ -205,6 +238,21 @@ void allreduce_(at::Tensor a, at::Tensor b)
     size_t bytes = (size_t)a.numel() * a.element_size();
     TORCH_CHECK(bytes % 16 == 0,
                 "barlink_sm86 allreduce_: byte size must be a multiple of 16");
+
+    if (g_peer) {
+        // SPMD cross-rank reduction: a and b are MY LOCAL tensors; after
+        // both ranks call, each holds my_value + peer_value.
+        cudaStream_t s = at::cuda::getCurrentCUDAStream(
+            a.get_device()).stream();
+        c10::cuda::CUDAGuard guard(a.get_device());
+        char err[BL_ERRBUF] = {0};
+        blCheck(bl_allreduce_peer(g_ctx, aPtr, bPtr, bytes, dt,
+                                  (void *)s, err, sizeof(err)), err);
+        return;
+    }
+
+    TORCH_CHECK(aIdx != bIdx, "barlink_sm86 allreduce_: tensors must live on "
+                              "different pool devices");
 
     cudaStream_t sA = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
     cudaStream_t sB = at::cuda::getCurrentCUDAStream(b.get_device()).stream();
@@ -244,6 +292,10 @@ at::Tensor readback(at::Tensor t)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("init", &init, py::arg("devices"), py::arg("pool_mb") = 64,
+          py::call_guard<py::gil_scoped_release>());
+    m.def("init_peer", &init_peer,
+          py::arg("device"), py::arg("pool_mb") = 64,
+          py::arg("sock_path"), py::arg("rank"),
           py::call_guard<py::gil_scoped_release>());
     m.def("shutdown", &shutdown);
     m.def("empty", &empty, py::arg("nbytes"), py::arg("device"),

@@ -12,6 +12,14 @@ import barlink_sm86 as bl
 
 
 def main():
+    if os.environ.get("BL_SKIP_INIT") == "1":
+        # peer-mode tests: each process initializes itself (init_peer) and
+        # keeps capabilities for its own cudaHostRegister; nothing to do here
+        script = sys.argv[1]
+        sys.argv = sys.argv[1:]
+        runpy.run_path(script, run_name="__main__")
+        return
+
     devs = [int(x) for x in os.environ.get("BL_DEVICES", "0,1").split(",")]
     pool_mb = int(os.environ.get("BL_POOL_MB", "64"))
     bl.init(devices=devs, pool_mb=pool_mb)  # drops caps on success
