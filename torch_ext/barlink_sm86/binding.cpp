@@ -21,6 +21,7 @@
 
 static blCtx *g_ctx = nullptr;
 static std::vector<int> g_devices;
+static int64_t g_pool_mb = 0;
 
 #define BL_ERRBUF 1024
 
@@ -71,9 +72,18 @@ static void checkPoolPtr(const at::Tensor &t, int *idxOut, void **ptrOut)
 
 void init(std::vector<int64_t> devices, int64_t pool_mb)
 {
-    if (g_ctx) bl_shutdown(g_ctx);
-    g_ctx = nullptr;
-    g_devices.clear();
+    // idempotent: under tools/blrun the pool is already up and the process
+    // can no longer re-register (caps dropped), so a matching re-init is a
+    // no-op instead of a capability error
+    if (g_ctx && devices.size() == g_devices.size() && pool_mb == g_pool_mb) {
+        bool same = true;
+        for (size_t i = 0; i < devices.size(); ++i)
+            same = same && devices[i] == g_devices[i];
+        if (same) return;
+    }
+    TORCH_CHECK(!g_ctx,
+                "barlink_sm86: already initialized with a different config; ",
+                "restart the process (re-init needs CAP_SYS_ADMIN)");
 
     TORCH_CHECK(devices.size() == 2, "barlink_sm86 v1: exactly 2 devices");
     TORCH_CHECK(pool_mb >= 4, "barlink_sm86: pool_mb must be >= 4");
@@ -87,6 +97,7 @@ void init(std::vector<int64_t> devices, int64_t pool_mb)
     blCheck(bl_init(&ctx, devs, 2, (size_t)pool_mb << 20, err, sizeof(err)), err);
     g_ctx = ctx;
     g_devices.assign(devs, devs + 2);
+    g_pool_mb = pool_mb;
     dropCapsAfterInit();
 }
 
@@ -94,6 +105,7 @@ void shutdown()
 {
     if (g_ctx) bl_shutdown(g_ctx);
     g_ctx = nullptr;
+    g_pool_mb = 0;
     g_devices.clear();
 }
 

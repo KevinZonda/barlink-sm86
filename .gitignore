@@ -28,3 +28,5 @@ torch_ext/build
 torch_ext/barlink_sm86/_C*.so
 __pycache__/
 *.pyc
+tools/caprun
+tools/blrun
