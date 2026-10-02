@@ -8,3 +8,13 @@ dist
 bench/*/bar1-p2p-write
 bench/*/bar1-p2p-write-580
 bench/*/stock-d2d
+
+# kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+Module.symvers
+modules.order
+.*.cmd
