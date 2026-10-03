@@ -1,0 +1,6 @@
+[rank1]:W1004 00:25:01.079000 111462 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:W1004 00:25:01.098000 111462 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[qwen38-int8 nccl rank=1] load=11s peak=14.9 GiB
+[rank1]:[W1004 00:25:14.096195622 ProcessGroupNCCL.cpp:5310] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+[qwen38-int8 nccl rank=1] 64 tokens in 7.13s = 8.97 tok/s (prompt 42 tok, prefill 128.2 ms, decode 109.31 ms/token avg, all_reduce x 0 = 0.0 ms GPU-timeline)
+SAMPLE: 我们班ifer我们班我们班我们班pthread CONDITIONS我们班我们班本发明的我们班我们班我们班我们班我们班我们班我们班 journalism我们班 journalism我们班我们班我们班我们班我们班我们班我们班我们班本发明的我们班我们班 efter本发明的本发明的 journalism我们班我们班我们班我们班 efter reck本发明的我们班我们班 Bernie波兰本发明的 jour

@@ -6,6 +6,9 @@
 #   bash demos/qwen_tp/qwen38_int8/run.sh both     # barlink -> nccl -> compare
 #   bash demos/qwen_tp/qwen38_int8/run.sh compare
 #
+# QWEN38_TAG_SUFFIX（默认空）追加到所有 tag，例如 QWEN38_TAG_SUFFIX=_fla
+# 可把 fla-kernel 结果与旧结果并存于 results/，不互相覆盖。
+#
 # Two-process launch templates:
 #   barlink: tools/blrun (LOCAL_RANK card selection, BL_SOCK_PATH)
 #   nccl:    CUDA_VISIBLE_DEVICES per process (stock torch, no caps)
@@ -18,6 +21,7 @@ cd "$ROOT"
 HERE=demos/qwen_tp/qwen38_int8
 OUT="$HERE/results"
 MODE="${1:-both}"
+SFX="${QWEN38_TAG_SUFFIX:-}"
 mkdir -p "$OUT"
 
 export BL_POOL_MB=192
@@ -73,7 +77,7 @@ run_one() {  # run_one <barlink|nccl> <tag> [extra worker args...]
 
 do_compare() {
     .venv/bin/python "$HERE/compare.py" --dir "$OUT" \
-        --tag-a barlink --tag-b nccl
+        --tag-a "barlink$SFX" --tag-b "nccl$SFX"
 }
 
 retry() {  # retry <phase-name> <fn...>
@@ -92,22 +96,22 @@ retry() {  # retry <phase-name> <fn...>
 }
 
 case "$MODE" in
-    barlink)  retry TP2-barlink run_one barlink barlink || exit 1 ;;
-    nccl)     retry TP2-nccl run_one nccl nccl || exit 1 ;;
+    barlink)  retry TP2-barlink run_one barlink "barlink$SFX" || exit 1 ;;
+    nccl)     retry TP2-nccl run_one nccl "nccl$SFX" || exit 1 ;;
     nocomm-barlink) retry TP2-barlink-nocomm \
-                        run_one barlink barlink_nc --no-comm || exit 1 ;;
+                        run_one barlink "barlink_nc$SFX" --no-comm || exit 1 ;;
     nocomm-nccl)    retry TP2-nccl-nocomm \
-                        run_one nccl nccl_nc --no-comm || exit 1 ;;
+                        run_one nccl "nccl_nc$SFX" --no-comm || exit 1 ;;
     all)
-        retry TP2-barlink run_one barlink barlink || exit 1
-        retry TP2-nccl run_one nccl nccl || exit 1
-        retry TP2-barlink-nocomm run_one barlink barlink_nc --no-comm || exit 1
-        retry TP2-nccl-nocomm run_one nccl nccl_nc --no-comm || exit 1
+        retry TP2-barlink run_one barlink "barlink$SFX" || exit 1
+        retry TP2-nccl run_one nccl "nccl$SFX" || exit 1
+        retry TP2-barlink-nocomm run_one barlink "barlink_nc$SFX" --no-comm || exit 1
+        retry TP2-nccl-nocomm run_one nccl "nccl_nc$SFX" --no-comm || exit 1
         do_compare || exit 1
         ;;
     both)
-        retry TP2-barlink run_one barlink barlink || exit 1
-        retry TP2-nccl run_one nccl nccl || exit 1
+        retry TP2-barlink run_one barlink "barlink$SFX" || exit 1
+        retry TP2-nccl run_one nccl "nccl$SFX" || exit 1
         do_compare || exit 1
         ;;
     compare) do_compare || exit 1 ;;

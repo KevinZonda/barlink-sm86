@@ -339,17 +339,37 @@ GDN 走 transformers 5.18 原生 torch kernel（无 fla/causal_conv1d，装了�
 
 | backend | tok/s | 通信开销 ms/token |
 |---|---|---|
-| barlink PG | 6.96（6.63–7.27 三次） | 32.0 |
+| barlink PG | **8.03**（早期 6.63–7.27 为共卡污染，已修正） | 12.8 |
 | NCCL（SHM 中转） | **8.03** | 12.5 |
 | 无通信对照（barlink / NCCL） | 8.95 / 8.93 | — |
 
 每 token 通信 = 128 次 rowwise all_reduce（10KB，down/o/out_proj 各一）+ 1 次
-lm_head 半 logits 交换（248KB）。摊到单次 all_reduce：barlink ~250 µs vs
-NCCL ~98 µs——**这个负载 NCCL 快 ~15%，瓶颈不是链路**（§7 微基准 barlink
-10KB allreduce 25 µs < NCCL 49 µs），而是 barlink 协议每 op 6 个 stream-
-ordered kernel：decode 是 ~4500 kernel/token 的串行 launch-bound 关键路径，
-每 op 多出的 kernel launch 全部落在关键路径上。要翻盘得压 kernel 数
-（小消息专用 fused 协议，TODO）。
+lm_head 半 logits 交换（248KB）。摊到单次 all_reduce：两 backend 都是
+~95–105 µs。**干净卡下两 backend 平手**（通信开销 12.8 vs 12.5 ms/token；
+最初测得的"NCCL 快 15%"是另一会话在卡上轮流跑 15.4GB 任务的共卡污染——其
+PCIe/IOMMU 流量不对称放大了 barlink 跨卡 flag 轮询延迟，那片 OOM 重试日志
+为证）。通信开销占 decode（~122ms）约 10%；其余是无通信对照也存在的固定
+成本：profiler 实测每 token ~29k 个 CUDA kernel、96ms device 时间，其中
+400 个 `_int_mm` 只有 21ms，~24k 个小 elementwise/copy kernel（动态量化
+wrapper 每 Linear ~10 个 + HF glue）才是主体。
+
+### with fla kernels（2026-10-04 补测）
+
+装上 `causal-conv1d 1.7.0`（源码编译 sm86 CUDA 扩展）与
+`flash-linear-attention 0.5.2` 后，transformers 自动走优化 kernel（回退
+警告消失）。正确性仍然逐位一致（fla vs 原生 rel_l2 = 0.0，barlink vs NCCL
+rel_l2 = 0.0）。结果（`QWEN38_TAG_SUFFIX=_fla`，与旧结果并存 results/）：
+
+| 环境 | barlink PG | NCCL | 无通信对照 | barlink 通信开销 |
+|---|---|---|---|---|
+| 原生 torch GDN | 8.03 | 8.03 | 8.95 / 8.93 | 12.8 ms/token |
+| fla 优化 GDN | 7.95（7.82–7.98） | 8.11（8.02–8.11） | 8.80 / 8.97 | 13.2 ms/token |
+
+fla 没带来端到端提速：GDN 原生路径只占每 token kernel 数的 ~13%（32.5k →
+28.7k，省 ~5ms device 时间，被 ±5% 运行噪声淹没）。瓶颈在量化 wrapper 与
+HF glue 的 kernel 密度，不在 GDN。**对 fused 小消息协议优先级的启示：不迫
+切**——两 backend 通信开销无差，压 barlink 协议 kernel 数（6→3）收益有限；
+更大的富矿是真 W8A16 weight-only kernel（Marlin 类）和量化/反量化 fuse。
 
 **正确性**：两 backend 输出**逐位相同**（64 token 全 match，首 token logits
 rel_l2 = 0.0；两 rank 加法都在 fp32 域一次舍入，与 NCCL bf16 SUM 的 2-rank
