@@ -133,3 +133,48 @@ BAR1 直连（kernel 写对端 BAR，`--both` 两方向取一）vs stock 580（�
 - ≥1 MiB 的 13.2 GB/s 是链路平台期（对照 barlink-pcie 在 x8 Gen4 的 12.7 GB/s ≈ 链路 80%），补丁大小不影响带宽
 - 提升随尺寸变小而增大：大包省一半 PCIe 往返，小包还省主机往返的固定延迟
 - **对 stock CUDA/NCCL 基准（p2pBandwidthLatencyTest、nccl-tests）无提升**——补丁只服务 dma-buf BAR1 路径，不解锁 `cudaDeviceCanAccessPeer`
+
+## 7. torch.distributed ProcessGroup 后端（barlink）
+
+`torch_ext/barlink_sm86/process_group.py` 把 peer 模式包装成 torch.distributed 后端，
+纯 Python，无需改 C++。注册 + 初始化三行：
+
+```python
+from barlink_sm86 import process_group as blpg
+blpg.init_process_group(init_method="tcp://127.0.0.1:29500", rank=r, world_size=2)
+dist.all_reduce(tensor)        # SUM；fp32/fp64/bf16 原生，fp16 经 fp32 staging
+```
+
+```bash
+bash torch_ext/tests/run_pg.sh    # 两进程全流程测试（allreduce/broadcast/barrier/复用/错误路径）
+```
+
+环境变量：`BL_POOL_MB`（默认 64，PG 测试用 192 跑 96 MiB 分块路径）、`BL_SOCK_PATH`
+（默认 `/tmp/barlink-pg-{uid}-{BL_PG_ID|default}.sock`）、`BL_DEVICE` / `LOCAL_RANK`
+（选卡，默认 rank）。
+
+限制清单（v1）：
+
+- **world_size 必须是 2**（底层链路双卡专用）；creator 里直接报错
+- **allreduce 只支持 ReduceOp.SUM**；dtype 支持 fp32/fp64/bf16/fp16/fp8×2/u8，其余 raise
+- **同步语义**：collective 返回 None 表示已排队，完成性由 current stream 的后续
+  enqueue/sync 保证，不是 host 同步
+- send/recv/all_gather/reduce_scatter 未实现（vLLM/DiT v1 用不到），调用 raise
+  NotImplementedError
+- subgroup（new_group 小于 world）不支持：后端是单例复用同一条链路，SPMD 纪律要求
+  两端调用序列完全一致
+- **torchrun 启动拿不到 CAP_SYS_ADMIN**（file cap 不跨 execve 传递），workaround：
+  继续用 `tools/blrun` 直启两个进程（`tests/run_pg.sh` 就是模板），不要 torchrun
+
+实测 PG 层 all_reduce 延迟（双 3080，2026-10-03，pool 192 MiB，50 次平均，
+raw bl 链路 ≤64 KiB 是 22-26 µs）：
+
+| size | PG all_reduce |
+|---|---|
+| 10 KB | 92 µs |
+| 64 KB | 96 µs |
+| 256 KB | 117 µs |
+| 1 MB | 205 µs |
+
+PG 层比 raw bl 多出的 ~70 µs 固定开销 = staging 填充/回拷（两次 D2D copy）+
+Python/trampoline 调度；带宽项（>256 KB 后每翻倍 +~90 µs ≈ 12 GB/s 链路速度）一致。

@@ -19,7 +19,7 @@
 //      card -> writer-side device pointer. One such write path per
 //      (owner pool, writer device) pair.
 //   5. Writers use a grid-stride kernel with st.global.wt 128-bit stores;
-//      verification reads on the OWNER card with ld.global.cv through its
+//      verification reads on the OWNER card with ld.relaxed.sys through its
 //      own VMM pointer (the copy engine can return stale L2 data: the
 //      receiving card's L2 is NOT coherent with incoming PCIe writes --
 //      barlink-pcie/findings/l2-not-coherent.md).
@@ -30,7 +30,7 @@
 // stale line (barlink-pcie/findings/l2-not-coherent.md). Synchronization
 // uses a marker flag in the pool's flag tail: the writer's LAST posted
 // store is the flag itself (same PCIe path, in-order delivery), and the
-// reader polls only the flag, with ld.global.cv, which bypasses L2 and
+// reader polls only the flag, with ld.relaxed.sys, which (measured) sees
 // DOES see inbound writes (l2-coherence-bypassable.md, ~3.2 us).
 //
 // This file has no torch dependency and compiles standalone:
@@ -278,10 +278,15 @@ __device__ __forceinline__ static void stwt128(void *p, uint4 v)
                  :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
 
+// ld.relaxed.sys on peer-written data: l2-coherence-bypassable.md measured
+// that ld.global.cv does NOT reliably see inbound PCIe writes when the line
+// is resident in L2 (it kept hitting the stale line for 46M polls), while
+// ld.volatile / ld.relaxed.sys do (~20 polls, ~3.2 us). All reads of
+// inbound-written data (peer scratch, flags, readback) MUST use this.
 __device__ __forceinline__ static uint4 ldcs128(const void *p)
 {
     uint4 v;
-    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
+    asm volatile("ld.relaxed.sys.global.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                  : "l"(p) : "memory");
     return v;
@@ -291,34 +296,38 @@ __device__ __forceinline__ static uint4 ldcs128(const void *p)
 // -------------------------------
 // Flags live in the OWNER pool's reserved 4 KiB tail (see Pool::usableSize);
 // each incoming direction (one per writer device) owns a 256-byte slot:
-//   +0: flag (u64 seq) -- payload-complete marker (written by the writer)
-//   +8: arm  (u64 seq) -- buffer-ready marker (written LOCALLY by the
-//                        owner, polled by the writer through its BAR view)
+//   +0: flag (u64 seq) -- payload-complete marker
+//   +8: arm  (u64 seq) -- buffer-ready marker
+// Both are written REMOTELY by the writer through its BAR path (.wt store
+// after a system fence) and polled LOCALLY by the owner with
+// ld.relaxed.sys -- the combination measured to see inbound PCIe writes
+// (l2-coherence-bypassable.md: local ld.volatile / ld.relaxed.sys polls see
+// inbound writes in ~3.2 us; BAR-view polling and ld.global.cv do NOT
+// reliably work).
 //
 // The arm handshake closes the fill race that exists in ANY cross-process
 // design: a local write to a buffer (the user's fill) is only ordered on the
 // owner's stream, so the peer's remote write to the same buffer could
 // otherwise land first and be overwritten. Per exchange step (seq k), on
 // each rank, all on one stream:
-//   1. owner stores arm = k locally    -- stream-ordered AFTER the caller's
-//                                         fills, visible to the peer's BAR
-//                                         reads (local .wt store, FB-backed)
-//   2. writer polls peer's arm >= k    -- BAR-view ld.global.cv (BAR reads
-//                                         hit framebuffer, bypassing the
-//                                         local L2 that hides inbound writes)
-//   3. writer k_copy payload + k_mark completion = k (same stream: one fence
-//      + one flag cover the posted writes; PCIe delivers them in order)
-//   4. owner polls its LOCAL completion flag >= k (ld.global.cv sees inbound
-//      PCIe writes -- barlink-pcie/findings/l2-coherence-bypassable.md)
-// Arm stores always precede arm waits on both sides, so the handshake
+//   1. writer stores arm = k into the PEER's arm slot   -- stream-ordered
+//      after the caller's local fills, fence covers them
+//   2. writer polls its LOCAL arm slot >= k              -- written by the
+//      peer's step-1 store; passes only when the peer's fills are done
+//   3. writer k_copy payload + stores completion = k into the peer's
+//      completion slot (same stream: hard kernel ordering + in-order PCIe
+//      posted-write delivery make the flag arrive after the payload)
+//   4. owner polls its LOCAL completion flag >= k        -- payload landed
+// Step-1 stores always precede step-2 waits on both sides, so the handshake
 // cannot deadlock; a rank running ahead simply spins in step 2.
 //
-// Cost per copy: one local arm store + one BAR poll + one completion poll,
-// instead of a per-block fence (a system fence per block costs ~1 us; at
-// 1024 blocks that is ~1 ms per 4 MiB copy -- measured as the bandwidth
-// regression this design fixes).
+// HARD REQUIREMENT (peer mode): dst and src must be DIFFERENT pool
+// buffers. With dst == src at the same offset, my payload overwrites the
+// peer's source buffer before the peer reads it (the two directions both
+// target that offset), and the peer ends up sending my own data back --
+// observed as "the receiver reads its own fill". bl_copy_ rejects it.
 //
-// The reader polls the flag through its LOCAL VMM pointer with ld.global.cv
+// The reader polls the flag through its LOCAL VMM pointer with ld.relaxed.sys
 // (bypasses L2; a spinning kernel CAN see inbound peer writes that way --
 // barlink-pcie/findings/l2-coherence-bypassable.md, ~3.2 us). It never
 // spins on payload. The flag value is monotone (u64 seq, 0 = never), so
@@ -343,16 +352,23 @@ __global__ void k_copy(const uint4 *__restrict__ src, uint4 *__restrict__ dst,
         stwt128(&dst[i], src[i]);
 }
 
-// Completion marker: one thread. The system fence drains every posted
-// payload write causally prior to this kernel (stream order), then the
-// flag store goes out on the same posted path, after all of them.
+// Arm marker: plain fence + store. The arm only orders the caller's LOCAL
+// fills (same-GPU writes the fence fully covers); no payload is in flight
+// yet, so no drain read is needed.
+// Marker: one thread, fence + store. Used for BOTH the arm (orders the
+// caller's local fills) and the completion (issued after the payload
+// kernel on the same stream: hard kernel ordering means every payload
+// store was issued before this kernel runs, and PCIe delivers posted
+// writes from one source in order -- the flag going out after the
+// payload). Callers must never use the same pool buffer as dst and src
+// in peer mode; see the check in bl_copy_.
 __global__ void k_mark(unsigned long long *flag, unsigned long long seq)
 {
     __threadfence_system();
     stwt64(flag, seq);
 }
 
-// Reader-side wait: poll the local flag with ld.global.cv until flag >= seq.
+// Reader-side wait: poll the local flag with ld.relaxed.sys until flag >= seq.
 // One block; timeout ~2 s -> __trap() surfaces as a CUDA error on sync.
 __global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
                             unsigned long long seq)
@@ -362,7 +378,8 @@ __global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
         unsigned ns = 32;
         for (;;) {
             unsigned long long v;
-            asm volatile("ld.global.cv.u64 %0, [%1];"
+            // ld.relaxed.sys, NOT ld.global.cv -- see ldcs128 above
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
                          : "=l"(v) : "l"(flag) : "memory");
             if (v >= seq) break;
             if (clock64() - t0 > 4LL * 1000 * 1000 * 1000)  // ~2-3 s @ ~1.5-2 GHz
@@ -394,7 +411,7 @@ struct BlVerifyOut {
     unsigned long long firstOff;
 };
 
-// Plain ld.global.cv readback of n4 uint4 elements into a staging buffer
+// Plain ld.relaxed.sys readback of n4 uint4 elements into a staging buffer
 // (used by bl_readback).
 __global__ void k_readback(const uint4 *__restrict__ src,
                            uint4 *__restrict__ out, int n4)
@@ -462,7 +479,7 @@ __global__ void k_verify(const uint4 *__restrict__ src, size_t n4,
 }
 
 // Local wrapping u8 add: a[i] += b[i] (SIMD u8x4 per 32-bit lane). 'b' was
-// written by the peer through the BAR, read it with ld.global.cv; 'a' is
+// written by the peer through the BAR, read it with ld.relaxed.sys; 'a' is
 // local traffic. Fast path for BL_DTYPE_U8 (kept from the byte-only era).
 __global__ void k_add(uint4 *__restrict__ a, const uint4 *__restrict__ b,
                       size_t n4)
@@ -932,7 +949,7 @@ struct blCtx {
 
 // Reserved pool tail for the flag slots (one 256-byte slot per writer
 // direction; u64 flag at +0, u64 done counter at +8). Written by peers
-// through the BAR, polled locally with ld.global.cv.
+// through the BAR, polled locally with ld.relaxed.sys.
 #define BL_FLAG_REGION 4096u
 #define BL_FLAG_SLOT   256u
 static size_t flagOff(const Pool &P, int writerIdx)
@@ -1230,6 +1247,19 @@ static bool poolHold(Pool &P, const Bdf &attachTo, char *err, size_t errlen)
         }
     }
     P.barOff = barOff;
+    if (std::getenv("BL_DEBUG_PEER")) {
+        std::fprintf(stderr, "[bl] poolHold: barOff=0x%llx nents=%u first=0x%llx "
+                    "last=0x%llx bar1=[0x%llx,0x%llx] size=%zu\n",
+                    (unsigned long long)P.barOff, (unsigned)sg.size(),
+                    (unsigned long long)sg.front().dma_address,
+                    (unsigned long long)sg.back().dma_address,
+                    (unsigned long long)P.bar1Start,
+                    (unsigned long long)P.bar1End, P.size);
+        for (size_t i = 0; i < sg.size() && i < 6; ++i)
+            std::fprintf(stderr, "[bl]   sg[%zu]=0x%llx len=0x%llx\n", i,
+                         (unsigned long long)sg[i].dma_address,
+                         (unsigned long long)sg[i].dma_len);
+    }
     return true;
 }
 
@@ -1513,7 +1543,7 @@ static int copyPayload(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr,
     k_copy<<<gridBlocks(n4, srcOrd), 256, 0, (cudaStream_t)srcStream>>>(
         (const uint4 *)srcPtr, (uint4 *)dstBar, n4);
     // completion marker on the SAME stream: hard kernel ordering makes the
-    // fence cover all of k_copy's posted writes (see protocol note above)
+    // fence cover all of k_copy's posted writes (see k_mark)
     k_mark<<<1, 1, 0, (cudaStream_t)srcStream>>>(
         (unsigned long long *)flagBar, seq);
     if (cudaGetLastError() != cudaSuccess) {
@@ -1581,6 +1611,14 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
             return -1;
         }
         uint8_t *dstBar = (uint8_t *)bar + ((uintptr_t)dstPtr - base);
+        if (dstPtr == srcPtr) {
+            setErr(err, errlen,
+                   "bl_copy_: peer mode requires dst and src to be DIFFERENT "
+                   "pool buffers (same-offset exchange self-collides: my "
+                   "payload would overwrite the peer's source before it is "
+                   "read -- the peer would send my own data back)");
+            return -1;
+        }
 
         uint64_t seq;
         {
@@ -1594,15 +1632,15 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
             return -1;
         }
         cudaStream_t s = (cudaStream_t)srcStream;
-        // 1. arm: ordered after the caller's local fills of MY dst
+        // 1. arm the peer (ordered after the caller's local fills, fence
+        //    covers them); 2. wait MY arm, written by the peer's step 1
         k_mark<<<1, 1, 0, s>>>(
-            (unsigned long long *)(uintptr_t)(
-                myP.dptr + flagOff(myP, peer) + 8), seq);
-        // 2. wait for the peer's arm through my BAR view of its pool
-        k_flag_wait<<<1, 32, 0, s>>>(
             (unsigned long long *)((uint8_t *)bar + flagOff(peerP, me) + 8),
             seq);
-        // 3. payload + completion mark
+        k_flag_wait<<<1, 32, 0, s>>>(
+            (unsigned long long *)(uintptr_t)(
+                myP.dptr + flagOff(myP, peer) + 8), seq);
+        // 3. payload + completion mark into the peer's completion slot
         size_t n4 = bytes / 16;
         k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
             (const uint4 *)srcPtr, (uint4 *)dstBar, n4);
@@ -1615,6 +1653,20 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
         if (cudaGetLastError() != cudaSuccess) {
             setErr(err, errlen, "bl_copy_: kernel launch failed");
             return -1;
+        }
+        if (std::getenv("BL_DEBUG_PEER")) {
+            unsigned long long arm = 0, done = 0;
+            cudaMemcpy(&arm, (void *)(uintptr_t)(myP.dptr + flagOff(myP, peer) + 8),
+                       8, cudaMemcpyDeviceToHost);
+            cudaMemcpy(&done, (void *)(uintptr_t)(myP.dptr + flagOff(myP, peer)),
+                       8, cudaMemcpyDeviceToHost);
+            unsigned long long myDone = 0;
+            cudaMemcpy(&myDone,
+                       (void *)(uintptr_t)((uint8_t *)bar + flagOff(peerP, me)),
+                       8, cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "[bl] rank %d copy seq=%llu: local arm=%llu "
+                        "done=%llu | my mark in peer=%llu\n",
+                        me, (unsigned long long)seq, arm, done, myDone);
         }
         return 0;
     }
@@ -2058,18 +2110,19 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
     cudaStream_t s = (cudaStream_t)stream;
 
-    // arm handshake (see the flag-slot protocol note): my scratch zone is
-    // ready to receive -- ordered after my previous-step local add, and
-    // visible to the peer through its BAR view of my pool
+    // arm handshake (see the flag-slot protocol note): announce readiness
+    // into the peer's arm slot, then wait MY arm slot (written by the
+    // peer). My previous-step local add finishing is covered because this
+    // store is stream-ordered after it.
     k_mark<<<1, 1, 0, s>>>(
-        (unsigned long long *)(uintptr_t)(
-            myP.dptr + flagOff(myP, peer) + 8), seq);
-    k_flag_wait<<<1, 32, 0, s>>>(
         (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
         seq);
+    k_flag_wait<<<1, 32, 0, s>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, peer) + 8), seq);
 
-    // BOTH payloads before the single completion mark: stream order lets one
-    // fence + one flag cover both writes. The peer runs the identical
+    // BOTH payloads before the single completion mark: stream order lets
+    // one fence + one flag cover both writes. The peer runs the identical
     // sequence concurrently, so the two directions overlap on the wire.
     k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
         (const uint4 *)bPtr, (uint4 *)(peerScratch + ob), n4);
@@ -2144,14 +2197,14 @@ extern "C" uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen)
     if (cudaSetDevice(myOrd) != cudaSuccess) return ~0ull;
     const size_t n4 = win / 16;
     // both ranks write the SAME pattern into the peer's scratch zone, so
-    // the two directions cannot conflict. Arm handshake first: the peer
-    // must be done reading its scratch zone from the previous step.
+    // the two directions cannot conflict on content. Arm handshake first
+    // (see the flag-slot protocol note).
     k_mark<<<1, 1>>>(
-        (unsigned long long *)(uintptr_t)(
-            myP.dptr + flagOff(myP, peer) + 8), seq);
-    k_flag_wait<<<1, 32>>>(
         (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
         seq);
+    k_flag_wait<<<1, 32>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, peer) + 8), seq);
     k_pattern<<<gridBlocks(n4, myOrd), 256>>>(
         (uint4 *)((uint8_t *)bar + off), n4, seed);
     k_mark<<<1, 1>>>(
@@ -2181,7 +2234,7 @@ extern "C" uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen)
 
     // Informational secondary proof: read MY OWN pattern back through the
     // BAR-view pointer (a GPU-side read of the peer BAR aperture with
-    // ld.global.cv). Our protocol never polls BAR-view flags (the local
+    // ld.relaxed.sys). Our protocol never polls BAR-view flags (the local
     // flag tail is the ordered channel), but this confirms the BAR is
     // readable from the GPU, which a BAR-polling design would rely on.
     {
@@ -2272,7 +2325,7 @@ extern "C" uint64_t bl_verify(blCtx *ctx, char *err, size_t errlen)
 }
 
 // ---------------------------------------------------------------------------
-// Reliable host readback (kernel + ld.global.cv) of an arbitrary pool region
+// Reliable host readback (kernel + ld.relaxed.sys) of an arbitrary pool region
 // ---------------------------------------------------------------------------
 
 extern "C" int bl_readback(blCtx *ctx, int devIdx, void *ptr, size_t bytes,

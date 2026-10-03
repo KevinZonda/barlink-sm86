@@ -122,7 +122,8 @@ torch_ext/
 │   ├── __init__.py           # lazy _C load, torch/CUDA sanity, actionable errors
 │   ├── core.cu               # mechanism + kernels, NO torch headers (standalone nvcc)
 │   ├── core.h                # plain-C API
-│   └── binding.cpp           # torch/pybind thin layer
+│   ├── binding.cpp           # torch/pybind thin layer
+│   └── process_group.py      # torch.distributed Backend (peer mode, pure Python)
 ├── tests/test_basic.py       # verify/copy_/allreduce_ vs CPU refs + small GB/s
 ├── tests/test_dtypes.py      # copy_/allreduce_ across fp32/fp64/bf16/fp8/u8
 ├── tests/test_peer.py        # cross-process SPMD: init_peer/copy_/allreduce_
@@ -139,6 +140,24 @@ byte-identical to CPU reference, allreduce_ both sides == (a+b)%256,
 **bandwidth 12.9 GB/s** (4 MiB per copy_, marker-flag async mode).
 `tests/test_dtypes.py`: copy_ + allreduce_ pass for u8, fp32, fp64, bf16,
 fp8_e4m3fn, fp8_e5m2.
+`tests/test_peer.py` + `tests/test_process_group.py`: cross-process SPMD
+and the torch.distributed backend, both green (PG latency in
+`../BUILD_AND_TEST.md` §7).
+
+Measured on this hardware since the peer-mode notes above:
+
+4. **Never read inbound-written data with `ld.global.cv`.** The project's
+   l2-coherence-bypassable finding left this contradiction open, and it
+   bit here: `ld.global.cv` kept hitting the stale L2 line (reads of
+   peer-written data returned the pre-write content, deterministically in
+   the tight exchange loop), while `ld.relaxed.sys` sees inbound writes
+   reliably. All flag polls and peer-data reads use `ld.relaxed.sys`.
+5. **Peer-mode `copy_` requires dst != src (different pool buffers).**
+   With dst == src at the same offset the exchange self-collides: my
+   payload overwrites the peer's source buffer before the peer reads it,
+   and the peer sends my own data back (observed as "receiver reads its
+   own fill", sometimes partially). `bl_copy_` rejects dst == src; the
+   ProcessGroup broadcast uses separate send/recv staging buffers.
 
 Hardware quirks discovered en route (encoded in core.cu comments):
 
@@ -207,17 +226,20 @@ scratch zone (`pool_mb >= 8`); user tensors must fit in the lower half.
 Memory layout per pool (both ranks identical): user tensors in
 `[0, size/2)`, scratch/exchange zone in `[size/2, size - 4 KiB)`, flag
 tail in the last 4 KiB. Flag slots (256 B per direction):
-`+0` payload-completion marker (written by the writer through the BAR),
-`+8` **arm** marker (written LOCALLY by the owner, polled by the writer
-through its BAR view with `ld.global.cv`).
+`+0` payload-completion marker, `+8` **arm** marker. Both are written
+REMOTELY by the writer (fence + `.wt` store through its BAR path) and
+polled LOCALLY with `ld.relaxed.sys` — the combination measured to see
+inbound PCIe writes (`ld.global.cv` does NOT, see the Status quirks).
 
 The arm handshake closes the fill race inherent to every cross-process
 design: a local fill of a buffer is only ordered on the owner's stream, so
 without it the peer's remote write could land first and be overwritten.
-Per step, on each rank's single stream: arm store (ordered after the
-caller's fills) → poll the peer's arm via BAR view → payload + completion
-mark → poll the local completion flag. Arm stores precede arm waits on
-both sides, so this cannot deadlock.
+Per step, on each rank's single stream: store arm into the peer's arm slot
+(ordered after the caller's fills) → poll MY arm slot (written by the
+peer) → payload + completion mark into the peer's completion slot → poll
+MY completion flag. Arm stores precede arm waits on both sides, so this
+cannot deadlock. `copy_` additionally requires dst != src (same-offset
+exchange self-collides — see the Status quirks).
 
 Run the peer test (orchestrates both ranks, propagates exit codes):
 
