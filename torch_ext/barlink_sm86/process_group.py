@@ -333,17 +333,105 @@ class BarlinkBackend(_C10D.Backend):
         if t2 is not orig:
             orig.copy_(t2)
 
-    # -- v1: not implemented ----------------------------------------------
-    def all_gather_single(self, out, inp, opts):
-        raise NotImplementedError(
-            "barlink: all_gather_into_tensor is not implemented in v1")
+    # -- collectives: all_gather ------------------------------------------
+    def all_gather_single(self, output, input, opts):
+        # output: [world * n] contiguous; input: [n]. rank r's slice at
+        # [r*n:(r+1)*n]. SPMD: both ranks copy locally, then exchange
+        # their slices through the p2p path (full duplex).
+        n = input.numel()
+        r = self.rank()
+        o2 = output.view(-1)
+        i2 = input.view(-1)
+        mine = o2[r * n:(r + 1) * n]
+        theirs = o2[(1 - r) * n:(2 - r) * n]
+        mine.copy_(i2)
+        self._send_impl(mine)
+        self._recv_impl(theirs)
+        return _COMPLETED_WORK
 
+    def allgather(self, output_tensors, input_tensors, opts=None):
+        # normalize to ranklist[r] = tensor or list-of-tensors for rank r.
+        # torch shapes seen in the wild:
+        #   dist.all_gather(list, t):   output_tensors = [[t_r0, t_r1]]
+        #   Backend-style:              output_tensors[r] = list per rank
+        #   overload 2:                 output_tensors = [t_r0, t_r1], t
+        if isinstance(input_tensors, torch.Tensor):
+            ins = [input_tensors]
+        else:
+            ins = list(input_tensors)
+        outs = list(output_tensors)
+        if isinstance(outs[0], torch.Tensor):
+            ranklist = outs                        # [t_r0, t_r1]
+        else:
+            inner = list(outs[0])
+            if len(outs) == 1 and len(inner) == 2 and \
+                    isinstance(inner[0], torch.Tensor):
+                ranklist = inner                   # [[t_r0, t_r1]] wrapper
+            else:
+                ranklist = [list(tl) for tl in outs]
+        r = self.rank()
+        peer = 1 - r
+        for i, t in enumerate(ins):
+            d, s = ranklist[r], ranklist[peer]
+            dst = (d[i] if isinstance(d, list) else d).view(-1)
+            src = (s[i] if isinstance(s, list) else s).view(-1)
+            dst.copy_(t.view(-1))
+            self._send_impl(dst)
+            self._recv_impl(src)
+        return _COMPLETED_WORK
+
+    # -- v1: not implemented ----------------------------------------------
     def reduce_scatter_single(self, out, inp, opts):
         raise NotImplementedError(
             "barlink: reduce_scatter_tensor is not implemented in v1")
 
     def scatter(self, output_tensors, input_tensors, opts):
         raise NotImplementedError("barlink: SCATTER_PROBE_12345")
+
+
+class _DummyBackend1(_C10D.Backend):
+    """Honest local-semantics backend for size-1 subgroups (vLLM builds
+    singleton groups for several of its communicator slices; the real
+    link is dual-GPU only). Every collective is the world-1 identity:
+    allreduce(SUM) leaves the tensor unchanged, all_gather copies the
+    input into this rank's slice, broadcast is a no-op. send/recv have
+    no peer and raise. Crucially this does NOT touch the bl link --
+    it must not init_peer, poll the pool, or share any state with the
+    world-2 singleton backend.
+    """
+
+    def __init__(self, rank):
+        super().__init__(rank, 1)
+
+    def name(self):
+        return "barlink-dummy"
+
+    def allreduce(self, tensors, opts):
+        return _COMPLETED_WORK
+
+    def all_gather_single(self, output, input, opts):
+        output.view(-1)[: input.numel()] = input.view(-1)
+        return _COMPLETED_WORK
+
+    def allgather(self, output_tensors, input_tensors, opts=None):
+        if isinstance(input_tensors, torch.Tensor):
+            output_tensors[0].copy_(input_tensors)
+        else:
+            for o, i in zip(output_tensors[0], input_tensors):
+                o.copy_(i)
+        return _COMPLETED_WORK
+
+    def broadcast(self, tensors, opts):
+        return _COMPLETED_WORK
+
+    def barrier(self, opts=None):
+        return _COMPLETED_WORK
+
+    def send(self, tensors, dstRank, tag):
+        raise RuntimeError("barlink-dummy (world 1): send has no peer")
+
+    def recv(self, tensors, srcRank, tag):
+        raise RuntimeError("barlink-dummy (world 1): recv has no peer")
 
 
 _backend = None
@@ -360,15 +448,18 @@ def _resolve_device(rank):
 def _creator(common_opts, backend_opts):
     # module-level singleton: a second creator call (new_group) reuses the
     # one peer link. NOTE: subgroups smaller than the world are NOT
-    # supported (the SPMD discipline requires identical sequences on both
-    # ranks of the link).
+    # supported on the real link (the SPMD discipline requires identical
+    # sequences on both ranks of the link); a SIZE-1 subgroup gets a
+    # stateless local-semantics dummy that never touches the link.
     global _backend
-    if _backend is not None:
-        return _backend
     rank = int(getattr(common_opts, "group_rank",
                        getattr(common_opts, "rank", 0)))
     size = int(getattr(common_opts, "group_size",
                        getattr(common_opts, "size", 0)))
+    if size == 1:
+        return _DummyBackend1(rank)
+    if _backend is not None:
+        return _backend
     if size != 2:
         raise RuntimeError(
             "barlink ProcessGroup: world_size must be exactly 2, got %d" % size)
