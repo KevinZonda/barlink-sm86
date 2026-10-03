@@ -315,3 +315,50 @@ torch 2.14.0+cu130，`BL_POOL_MB=192`。NCCL 分支每进程用
 `CUDA_VISIBLE_DEVICES` 固定一张卡（stock torch，无需 caps）；本机双 3080
 无 P2P，NCCL 走 SHM/主机内存中转，init 前设 `NCCL_P2P_DISABLE=1`
 `NCCL_IB_DISABLE=1` 跳过能力探测。
+
+## 9. Qwen3.8-27B INT8 W8A16 TP=2 decode：barlink PG vs NCCL（2026-10-04）
+
+模型 `/mnt/modelzoo/lued/Qwen3.8-27B-INT8-W8A16-MTP`：compressed-tensors
+pack-quantized INT8 W8A16（group 128 sym），64 层混合 GDN 线性注意力（48）
++ 全注意力（16），hidden 5120，vocab 248320。代码在 `demos/qwen_tp/qwen38_int8/`
+（`run.sh all` 一条命令跑完四组 + 正确性比对，结果存 `results/`）。
+
+**int8 实际计算路径**（两 backend 完全相同的分片与计算，第一原则）：checkpoint
+的 pack-quantized int32 权重按 **bias-128 字节序**解包（
+`packed.view(int8) ^ -128`，与 compressed_tensors unpacker 逐元素验证过），
+group-128 bf16 scale 在 fp32 下精确 fold 成 per-row int8，激活做 per-token
+动态 int8 量化，matmul 走 **`torch._int_mm`（cublasLt IMMA）**——decode 每
+token 每卡只读 1 B/param（int8 shard 11.3 GB）。没有可用的 sm86 W8A16
+weight-only kernel（Marlin 只在 vLLM 里；torchao CUDA groupwise 会物化 bf16），
+且 bf16 全量反量化 27 GB/卡装不下，故用 W8A8 动态量化替代——两侧一致，
+对比有效。`_int_mm` 要求 m>16，decode m=1 时 pad 到 32 行（带宽不变）。
+GDN 走 transformers 5.18 原生 torch kernel（无 fla/causal_conv1d，装了就更快，
+两边同路径即可）。
+
+**延迟**（greedy，prompt 42 tok，warmup 16，计时 64 tok，双 3080，2026-10-04）：
+
+| backend | tok/s | 通信开销 ms/token |
+|---|---|---|
+| barlink PG | 6.96（6.63–7.27 三次） | 32.0 |
+| NCCL（SHM 中转） | **8.03** | 12.5 |
+| 无通信对照（barlink / NCCL） | 8.95 / 8.93 | — |
+
+每 token 通信 = 128 次 rowwise all_reduce（10KB，down/o/out_proj 各一）+ 1 次
+lm_head 半 logits 交换（248KB）。摊到单次 all_reduce：barlink ~250 µs vs
+NCCL ~98 µs——**这个负载 NCCL 快 ~15%，瓶颈不是链路**（§7 微基准 barlink
+10KB allreduce 25 µs < NCCL 49 µs），而是 barlink 协议每 op 6 个 stream-
+ordered kernel：decode 是 ~4500 kernel/token 的串行 launch-bound 关键路径，
+每 op 多出的 kernel launch 全部落在关键路径上。要翻盘得压 kernel 数
+（小消息专用 fused 协议，TODO）。
+
+**正确性**：两 backend 输出**逐位相同**（64 token 全 match，首 token logits
+rel_l2 = 0.0；两 rank 加法都在 fp32 域一次舍入，与 NCCL bf16 SUM 的 2-rank
+情形逐位一致）。`results/correctness_barlink_vs_nccl.json`。
+
+两个平台坑（都写了备注）：
+- torch 2.14 的 NCCL lazy p2p communicator 在本平台**裸 isend/irecv 双卡
+  必现 illegal memory access**（与 NCCL_P2P_DISABLE 无关，最小复现 10 行）；
+  NCCL 分支的 lm_head 交换改用 all_gather（barlink 分支用 isend/irecv 零拷贝
+  p2p；barlink PG 未实现 all_gather）。
+- run.sh 的后台管道不能 `| tee`（`$!` 是 tee 的 pid，真实退出码丢失，曾把
+  崩溃的 phase 标成 OK）；日志直写文件。
