@@ -32,6 +32,18 @@ def _load():
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
+    # torch-major-version-specific prebuilt extension (e.g. _C.torch213.so,
+    # built for the vllm venv's torch): the pybind ABI is NOT stable across
+    # torch versions, so multiple builds can coexist next to the default
+    # _C*.so (always built against the repo's primary venv).
+    tv = torch.__version__.split("+")[0].split(".")
+    tagged = os.path.join(here, "_C.torch%s%s.so" % (tv[0], tv[1]))
+    if os.path.exists(tagged):
+        import importlib.util as ilutil
+        spec = ilutil.spec_from_file_location("barlink_sm86._C", tagged)
+        mod = ilutil.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
     try:
         mod = importlib.import_module("barlink_sm86._C")
     except ImportError as e:

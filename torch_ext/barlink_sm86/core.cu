@@ -352,19 +352,17 @@ __global__ void k_copy(const uint4 *__restrict__ src, uint4 *__restrict__ dst,
         stwt128(&dst[i], src[i]);
 }
 
-// Arm marker: plain fence + store. The arm only orders the caller's LOCAL
-// fills (same-GPU writes the fence fully covers); no payload is in flight
-// yet, so no drain read is needed.
-// Marker: one thread, fence + store. Used for BOTH the arm (orders the
-// caller's local fills) and the completion (issued after the payload
-// kernel on the same stream: hard kernel ordering means every payload
-// store was issued before this kernel runs, and PCIe delivers posted
-// writes from one source in order -- the flag going out after the
-// payload). Callers must never use the same pool buffer as dst and src
-// in peer mode; see the check in bl_copy_.
+// Marker: one thread, one .wt store. NO __threadfence_system: every use
+// is ordered by KERNEL BOUNDARIES (the caller's fills and the payload
+// kernel all completed before this kernel runs), and PCIe delivers
+// posted writes from one source in order -- the flag goes out after the
+// payload it marks. The fence is not only redundant but HARMFUL: it
+// waits for full write-completion/visibility of every outstanding BAR
+// store, which is SECONDS-scale under bidirectional load (measured:
+// ~2.4 s for a 16 MB payload) and blows the receiver's flag-wait
+// timeout. Used for both the arm and the completion markers.
 __global__ void k_mark(unsigned long long *flag, unsigned long long seq)
 {
-    __threadfence_system();
     stwt64(flag, seq);
 }
 
@@ -387,7 +385,7 @@ __global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
             asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
                          : "=l"(v) : "l"(flag) : "memory");
             if (v >= seq) break;
-            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000)  // ~2-3 s @ ~1.5-2 GHz
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000)  // ~2-3 s @ ~1.5-2 GHz
                 __trap();
             // pure spin: __nanosleep rounds up to timer ticks (~32 us+),
             // which dominated the wait latency in decode-TP profiling;
@@ -1079,6 +1077,9 @@ struct blCtx {
     uint64_t p2pRecvSeq = 0;
     cudaStream_t sendStream = nullptr;   // lazily created (non-blocking)
     cudaEvent_t  evSend = nullptr;       // recorded after each send
+    cudaEvent_t  evCaller = nullptr;     // reusable caller<->send join event
+                                         // (cached: cudaEventCreate is
+                                         // illegal inside CUDA graph capture)
 
     // fused small-message allreduce (<= BL_FUSED_MAX): per-direction ordinal
     // and a dedicated scratch slice at the TOP of the allreduce half (so
@@ -1598,6 +1599,7 @@ extern "C" void bl_shutdown(blCtx *ctx)
     // p2p side stream / event (user contract: streams are idle at shutdown,
     // same as the pool teardown below)
     if (ctx->evSend) { cudaEventDestroy(ctx->evSend); ctx->evSend = nullptr; }
+    if (ctx->evCaller) { cudaEventDestroy(ctx->evCaller); ctx->evCaller = nullptr; }
     if (ctx->sendStream) {
         cudaStreamDestroy(ctx->sendStream);
         ctx->sendStream = nullptr;
@@ -2202,6 +2204,7 @@ extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
         delete ctx; return -1;
     }
 
+    initWaitCap();
     // caps were only needed for the cudaHostRegister above
     bl_drop_caps();
     *out = ctx;
@@ -2279,7 +2282,7 @@ __global__ void k_fused_send(const uint4 *__restrict__ in,
             asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
                          : "=l"(v) : "l"(receipt) : "memory");
             if (v >= seq - 1) break;
-            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
             __nanosleep(ns);
             if (ns < (1u << 20)) ns <<= 1;
         }
@@ -2322,7 +2325,7 @@ __global__ void k_fused_recv_t(uint4 *__restrict__ out,
             asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
                          : "=l"(v) : "l"(flag) : "memory");
             if (v >= seq) break;
-            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
             __nanosleep(ns);
             if (ns < (1u << 20)) ns <<= 1;
         }
@@ -2375,7 +2378,7 @@ __global__ void k_fused_recv_fp8(uint4 *__restrict__ out,
             asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
                          : "=l"(v) : "l"(flag) : "memory");
             if (v >= seq) break;
-            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
             __nanosleep(ns);
             if (ns < (1u << 20)) ns <<= 1;
         }
@@ -2765,7 +2768,9 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     const size_t n4 = bytes / 16;
     uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
     cudaStream_t s = (cudaStream_t)stream;
+    BL_CAPDBG("predlaunch");
     joinSendStream(ctx, s);
+    BL_CAPDBG("join");
 
     // arm handshake (see the flag-slot protocol note): announce readiness
     // into the peer's arm slot, then wait MY arm slot (written by the
@@ -2824,11 +2829,24 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     return 0;
 }
 
+#define BL_CAPDBG(where) do { \
+    if (std::getenv("BL_CAPDBG")) { \
+        cudaError_t e_ = cudaGetLastError(); \
+        if (e_ != cudaSuccess) { \
+            std::string m_ = std::string("CAPDBG ") + (where) + ": " + \
+                             cudaGetErrorString(e_); \
+            setErr(err, errlen, m_.c_str()); \
+            return -1; \
+        } \
+    } \
+} while (0)
+
 extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
                                       void *outPtr, size_t bytes, int dtype,
                                       void *stream, char *err, size_t errlen)
 {
     setErr(err, errlen, "");
+    BL_CAPDBG("entry");
     if (!ctx || !ctx->peerMode || !inPtr || !outPtr || bytes == 0 ||
         bytes % 16 != 0) {
         setErr(err, errlen,
@@ -2904,6 +2922,8 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
         k_fused_send<<<fblocks, 256, 0, s>>>(
             (const uint4 *)inPtr, (uint4 *)((uint8_t *)bar + ctx->fusedZoneBase),
             myReceipt, peerFlagBar, sendCnt, fseq, fn4);
+        BL_CAPDBG("fused-send");
+        BL_CAPDBG("fused-recv-pre");
         if (launchFusedRecv(dtype, (uint4 *)outPtr, (const uint4 *)inPtr,
                             (const uint4 *)(uintptr_t)(
                                 myP.dptr + ctx->fusedZoneBase),
@@ -2913,6 +2933,7 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
                    "bl_allreduce_into_peer: fused path bad dtype (internal)");
             return -1;
         }
+        BL_CAPDBG("fused-recv");
         if (cudaGetLastError() != cudaSuccess) {
             setErr(err, errlen,
                    "bl_allreduce_into_peer: fused kernel launch failed");
@@ -2937,17 +2958,21 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     k_mark<<<1, 1, 0, s>>>(
         (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
         seq);
+    BL_CAPDBG("arm-mark");
     k_flag_wait<<<1, 32, 0, s>>>(
         (unsigned long long *)(uintptr_t)(
             myP.dptr + flagOff(myP, peer) + 8), seq);
+    BL_CAPDBG("arm-wait");
 
     // single payload: read MY 'in' (plain local loads), st.global.wt into
     // the peer's scratch; one completion mark covers it
     k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
         (const uint4 *)inPtr, (uint4 *)peerScratch, n4);
+    BL_CAPDBG("payload");
     k_mark<<<1, 1, 0, s>>>(
         (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me)),
         seq);
+    BL_CAPDBG("mark");
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "bl_allreduce_into_peer: kernel launch failed");
         return -1;
@@ -2958,6 +2983,7 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
         myP.dptr + flagOff(myP, peer));
     k_flag_wait<<<1, 32, 0, s>>>(myFlag, seq);
+    BL_CAPDBG("flagwait");
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen,
                "bl_allreduce_into_peer: flag-wait launch failed");
@@ -3003,17 +3029,30 @@ static int ensureSendStream(blCtx *ctx, char *err, size_t errlen)
         setErr(err, errlen, "bl p2p: send-event creation failed");
         return -1;
     }
+    if (cudaEventCreateWithFlags(&ctx->evCaller, cudaEventDisableTiming)
+            != cudaSuccess) {
+        setErr(err, errlen, "bl p2p: caller-event creation failed");
+        return -1;
+    }
     return 0;
 }
 
 // Order a caller-stream protocol op (allreduce / copy / readback) after all
 // pending p2p sends: a payload reads the user's 'in' tensor on the send
 // stream, and the collective's add (or a pool copy) must not overwrite that
-// tensor early.
+// tensor early. SKIPPED while the caller stream is capturing: waiting an
+// event recorded before the capture invalidates the capture
+// (cudaErrorStreamCaptureInvalidated), and inside a replayed graph the
+// send-stream ordering is fixed anyway.
 static void joinSendStream(blCtx *ctx, cudaStream_t cs)
 {
-    if (ctx->sendStream && ctx->evSend)
-        cudaStreamWaitEvent(cs, ctx->evSend, 0);
+    if (!ctx->sendStream || !ctx->evSend)
+        return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cs, &st) == cudaSuccess &&
+        st != cudaStreamCaptureStatusNone)
+        return;
+    cudaStreamWaitEvent(cs, ctx->evSend, 0);
 }
 
 // Shared prologue for the zero-copy p2p pair: peer-mode/context checks,
@@ -3087,29 +3126,48 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     }
     if (ensureSendStream(ctx, err, errlen) != 0)
         return -1;
+    const bool noSide = std::getenv("BL_P2P_NO_SIDESTREAM") != nullptr;
+    if (noSide) {
+        // diagnostic: run the send on the CALLER's stream instead of the
+        // side stream (the 6-kernel arm path's shape)
+        cudaStream_t cs = (cudaStream_t)stream;
+        const size_t n4d = bytes / 16;
+        if (seq > 1 && !std::getenv("BL_P2P_NO_RECEIPT")) {
+            k_flag_wait<<<1, 32, 0, cs>>>(
+                (unsigned long long *)(uintptr_t)(
+                    myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8), seq - 1);
+        }
+        k_copy<<<gridBlocks(n4d, myOrd), 256, 0, cs>>>(
+            (const uint4 *)inPtr, (uint4 *)peerScratch, n4d);
+        if (!std::getenv("BL_P2P_NO_MARK"))
+            k_mark<<<1, 1, 0, cs>>>(
+                (unsigned long long *)((uint8_t *)bar +
+                                       flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
+                seq);
+        if (cudaGetLastError() != cudaSuccess) {
+            setErr(err, errlen,
+                   "bl_send_into_peer: caller-stream launch failed");
+            return -1;
+        }
+        return 0;
+    }
     const size_t n4 = bytes / 16;
     uint8_t *peerScratch = (uint8_t *)bar + ctx->p2pScratchBase;
     cudaStream_t ss = ctx->sendStream;
 
     // join the caller's stream: the payload must see every local write to
     // 'in' enqueued so far (user fills, prior collectives). Record on the
-    // caller's stream, wait on the send stream.
-    cudaEvent_t evCaller = nullptr;
-    if (cudaEventCreateWithFlags(&evCaller, cudaEventDisableTiming)
-            != cudaSuccess) {
-        setErr(err, errlen, "bl_send_into_peer: caller-event creation failed");
-        return -1;
-    }
-    cudaEventRecord(evCaller, (cudaStream_t)stream);
-    cudaStreamWaitEvent(ss, evCaller, 0);
-    cudaEventDestroy(evCaller);
+    // caller's stream, wait on the send stream. The event is cached on the
+    // ctx (cudaEventCreate is illegal inside CUDA graph capture).
+    cudaEventRecord(ctx->evCaller, (cudaStream_t)stream);
+    cudaStreamWaitEvent(ss, ctx->evCaller, 0);
 
     // consumed-receipt wait for exchange k > 1 (on the send stream): the
     // peer's recv k-1 posted it stream-ordered after its move kernel
     // finished READING the scratch, so this payload cannot overwrite
     // scratch the peer is still reading. (k == 1 skips the wait: nothing
     // consumed the p2p zone before.)
-    if (seq > 1) {
+    if (seq > 1 && !std::getenv("BL_P2P_NO_RECEIPT")) {
         k_flag_wait<<<1, 32, 0, ss>>>(
             (unsigned long long *)(uintptr_t)(
                 myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8), seq - 1);
@@ -3118,10 +3176,11 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     // peer's p2p scratch zone; one completion mark covers it
     k_copy<<<gridBlocks(n4, myOrd), 256, 0, ss>>>(
         (const uint4 *)inPtr, (uint4 *)peerScratch, n4);
-    k_mark<<<1, 1, 0, ss>>>(
-        (unsigned long long *)((uint8_t *)bar +
-                               flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
-        seq);
+    if (!std::getenv("BL_P2P_NO_MARK"))
+        k_mark<<<1, 1, 0, ss>>>(
+            (unsigned long long *)((uint8_t *)bar +
+                                   flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
+            seq);
     if (cudaEventRecord(ctx->evSend, ss) != cudaSuccess ||
         cudaGetLastError() != cudaSuccess) {
         std::string es = cudaGetErrorString(cudaGetLastError());
@@ -3271,6 +3330,36 @@ extern "C" uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen)
     std::printf("bl_verify_peer: rank %d: peer -> me bad_bytes = %llu of %zu\n",
                 me, (unsigned long long)res.bad, win);
     return res.bad;
+}
+
+// debug: host read of slots 0..7 (+0 and +8) of the local pool's flag tail
+extern "C" int bl_debug_flags(blCtx *ctx, unsigned long long *vals,
+                              char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode || !vals) return -1;
+    Pool &myP = ctx->pools[ctx->myRank];
+    if (cudaSetDevice(ctx->devices[ctx->myRank]) != cudaSuccess) return -1;
+    // dedicated non-blocking stream: the legacy default stream would queue
+    // behind the spinning flag-wait kernels and never complete
+    static cudaStream_t dbgStream = nullptr;
+    if (!dbgStream &&
+        cudaStreamCreateWithFlags(&dbgStream, cudaStreamNonBlocking)
+            != cudaSuccess)
+        return -1;
+    for (int s = 0; s < 8; ++s) {
+        for (int k = 0; k < 2; ++k) {
+            unsigned long long v = 0;
+            void *p = (void *)(uintptr_t)(myP.dptr + flagOff(myP, s) + 8 * k);
+            if (cudaMemcpyAsync(&v, p, 8, cudaMemcpyDeviceToHost, dbgStream)
+                    != cudaSuccess ||
+                cudaStreamSynchronize(dbgStream) != cudaSuccess)
+                return -1;
+            vals[s * 2 + k] = v;
+        }
+    }
+    cudaGetLastError();
+    return 0;
 }
 
 extern "C" uint64_t bl_verify(blCtx *ctx, char *err, size_t errlen)

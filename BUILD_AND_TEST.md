@@ -454,3 +454,65 @@ host 派发 + launch 间隙 ~60 ms，远超 GPU 计算（TP=1 50 ms，TP=2 每 r
 
 运行：`bash demos/qwen_tp/run.sh [tp1|barlink|nccl]`（等卡窗口+重试；
 worker 加载期间持有 15 GiB 显存占位防其它实验插队）。
+
+## 10. vLLM 接入（barlink PG 作为 vLLM TP 通信后端）
+
+**状态（2026-10-04）：`--enforce-eager` 全链路跑通**；CUDA graph 捕获仍被
+invalidate，原因未定位（见下）。环境：独立 `.venv-vllm`（py3.14 + torch
+2.14.0 + vllm 0.30.0，NJU 镜像）。
+
+接入件（本仓库）：
+
+- `vllm_barlink/` shim 包：注册 barlink backend；**惰性**包
+  `init_process_group`/`is_backend_available`（启动时 import barlink_sm86
+  会让 vllm 的 EngineCore 进程在 fork TP worker 之前初始化 CUDA —— bisect
+  实证，惰性化后消失）；把 vllm 0.30 硬编码的 `"cpu:gloo,cuda:nccl"` 改写为
+  `cuda:barlink`；默认 `VLLM_DISABLE_PYNCCL=1` 让 CudaCommunicator 的
+  all_reduce/all_gather 走 torch-PG 回退（== barlink）。
+  `install_pth.sh <venv>` 在 venv 装 `.pth` 实现每次 python 启动自动加载。
+- `vllm_barlink/entry.py`：blrun 硬编码 `<repo>/.venv/bin/python`，但
+  ambient cap 跨 execve 存活 —— 跳板用 vllm venv 的 python 重_exec 目标
+  脚本，cap 一路传到 vllm spawn 的每个 worker（各 rank 自己的 init_peer
+  后自行丢权）。
+- 扩展双构建：pybind ABI 不跨 torch 版本，`barlink_sm86/_C.torch<XY>.so`
+  按 torch 版本选加载（`_load()` 自动探测）；vllm venv 构建命令：
+  `cd torch_ext && rm -rf build-vllm && TORCH_CUDA_ARCH_LIST=8.6
+  ../.venv-vllm/bin/python setup.py build_ext --inplace --build-lib build-vllm
+  && cp build-vllm/barlink_sm86/_C*.so barlink_sm86/_C.torch214.so`
+  （**注意 torch 2.13.0 的 `Backend` pybind 没有构造器** ——
+  "No constructor defined!"，python 扩展后端在 2.13.0 上完全无法实例化，
+  2.14 已修；vllm 0.27–0.30 全部钉死 torch==2.13.0，故 vllm venv 用
+  torch 2.14.0 + torchvision 0.29.0 + triton 3.8.0 --no-deps 覆盖，实测
+  vllm 0.30 可正常运行）
+- PG 层新能力（全部带测试）：`all_gather_single`/`allgather`（对端半片经
+  p2p 零拷贝全双工交换）、size-1 子组的 `_DummyBackend1` 诚实本地语义
+  （vllm 会建 singleton 子组，旧实现 raise 直接崩初始化；dummy 不触碰链路
+  单例）。
+
+```bash
+# 冒烟（TP=2, Qwen2-1.5B, graph 关闭）：
+PATH="$PWD/.venv-vllm/bin:$PATH" ENFORCE_EAGER=1 BL_SKIP_INIT=1 BL_POOL_MB=192 \
+    HF_HUB_OFFLINE=1 tools/blrun vllm_barlink/entry.py demos/vllm_bl/smoke_vllm.py
+# 输出示例：' John and I am a 2017 graduate of the University of Texas at ...'
+```
+
+**两个平台级发现（重要）**：
+
+1. **BAR 写入完成（ack） pace ~7–10 MB/s，交付（delivery）13 GB/s**。
+   `__threadfence_system`/kernel 完成会等全部 outstanding BAR store 的完成
+   确认，对端有读/轮询负载时该确认以 ~7-10 MB/s 推进（16MB payload ≈
+   2.4s）。§6 的 13.2 GB/s 是 event 口径的交付带宽，不含完成等待。后果：
+   大消息（>1MB）的 op 延迟是秒级；已从 `k_mark` 移除 fence（冗余且有害：
+   kernel 边界 + 单源 PCIe 保序已足够，全回归通过）；所有 flag 等待超时
+   提到 ~200e9 时钟。小消息（≤64KB，LLM decode 场景）不受影响（10KB
+   allreduce 仍 ~19µs）。**多 chunk 全双工 p2p（>32MB 分片）有一个未解的
+   flag 送达病理（~4.4s 上下文死亡，coredump 显示 k_flag_wait SIGTRAP 但
+   时序对不上任何超时预算）** —— PG 层 p2p 分片因此上限提到整区（47MB，
+   单 chunk），大消息走单 chunk（慢但正确）。
+2. **CUDA graph 捕获**：隔离复现（裸 CUDAGraph + dist.all_reduce，fused 和
+   旧路径、单次/重复 replay）**全部通过**；但在 vllm piecewise 捕获里
+   allreduce 首次进入图时 capture invalidated（`joinSendStream` 的跨流
+   event 等待已做 capture 跳过，仍失败；vllm worker 会剥离自定义环境变量，
+   埋点需要在 core 里硬编码）。`--enforce-eager` 跑通在先，捕获问题留作
+   TODO（方向：piecewise 捕获下 c10d 扩展后端的交互，或给 vllm 的
+   all_reduce op 注册为 splitting op 使其不进图）。

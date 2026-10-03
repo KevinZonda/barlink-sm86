@@ -161,6 +161,11 @@ uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen);
 int  bl_probe_bar_atomic(blCtx *ctx, unsigned long long *res, int iters,
                          void *stream, char *err, size_t errlen);
 
+// debug: host read of the local pool's flag-tail slots (+0/+8 of slots
+// 0..7), for watching the handshake while a wait spins
+int  bl_debug_flags(blCtx *ctx, unsigned long long *vals,
+                    char *err, size_t errlen);
+
 // Drop all capabilities (prctl ambient clear + capset). Called by the
 // binding after a successful init; harmless without privileges.
 void bl_drop_caps(void);

@@ -392,6 +392,20 @@ at::Tensor bar_atomic_probe(int64_t iters)
     return out;
 }
 
+// host read of the local pool's flag-tail slots (+0/+8 of slots 0..7):
+// watch the handshake while a wait spins (debug only)
+at::Tensor debug_flags()
+{
+    TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
+    unsigned long long vals[16] = {0};
+    char err[BL_ERRBUF] = {0};
+    blCheck(bl_debug_flags(g_ctx, vals, err, sizeof(err)), err);
+    auto out = at::empty({16}, at::TensorOptions().dtype(at::kLong));
+    for (int i = 0; i < 16; ++i)
+        out[i] = (int64_t)vals[i];
+    return out;
+}
+
 int64_t verify()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -442,4 +456,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("readback", &readback, py::call_guard<py::gil_scoped_release>());
     m.def("bar_atomic_probe", &bar_atomic_probe, py::arg("iters"),
           py::call_guard<py::gil_scoped_release>());
+    m.def("debug_flags", &debug_flags, py::call_guard<py::gil_scoped_release>());
 }

@@ -21,6 +21,7 @@
 # flag waits are stream-ordered). They are NOT host-synchronous.
 
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -84,7 +85,16 @@ class BarlinkBackend(_C10D.Backend):
             raise RuntimeError(
                 "barlink ProcessGroup: world_size must be exactly 2 "
                 "(the underlying peer link is dual-GPU only), got %d" % size)
+        if os.environ.get("BL_PG_DEBUG") == "1":
+            sys.stderr.write(
+                "[blpg] init rank=%d size=%d device=%s sock=%s "
+                "cuda_visible=%r local_rank=%r\n"
+                % (rank, size, device, sock_path,
+                   os.environ.get("CUDA_VISIBLE_DEVICES"),
+                   os.environ.get("LOCAL_RANK")))
         bl._C.init_peer(device.index, pool_mb, sock_path, rank)
+        if os.environ.get("BL_PG_DEBUG") == "1":
+            sys.stderr.write("[blpg] init_peer OK rank=%d\n" % rank)
 
     # -- identity ---------------------------------------------------------
     def name(self):
@@ -117,7 +127,13 @@ class BarlinkBackend(_C10D.Backend):
         return buf
 
     # -- collectives ------------------------------------------------------
+    def _dbg(self, *a):
+        if os.environ.get("BL_PG_DEBUG") == "1":
+            sys.stderr.write("[blpg] " + " ".join(str(x) for x in a) + "\n")
+
     def allreduce(self, tensors, opts):
+        self._dbg("allreduce", tuple(tensors[0].shape), tensors[0].dtype,
+                  tensors[0].is_cuda)
         op = getattr(opts, "reduceOp", None)
         if op is not None and op != dist.ReduceOp.SUM:
             raise RuntimeError(
@@ -226,6 +242,7 @@ class BarlinkBackend(_C10D.Backend):
         return None
 
     def broadcast(self, tensors, opts):
+        self._dbg("broadcast", tuple(tensors[0].shape), tensors[0].dtype)
         t = self._to_device(tensors[0])
         root = getattr(opts, "rootRank", 0)
         n16 = _round16(t.numel() * t.element_size())
@@ -245,6 +262,7 @@ class BarlinkBackend(_C10D.Backend):
         return _COMPLETED_WORK
 
     def barrier(self, opts):
+        self._dbg("barrier")
         x, y = self._ar_pair(16, torch.uint8)   # garbage in, ignored out
         bl.allreduce_(x, y)
         return _COMPLETED_WORK
@@ -282,9 +300,17 @@ class BarlinkBackend(_C10D.Backend):
 
     def _p2p_zerocopy(self, t, send):
         nbytes = t.numel() * t.element_size()
+        self._dbg("p2p_zerocopy send=%s nbytes=%d zc=%s" %
+                  (send, nbytes, self._zc_p2p_usable(t)))
         # chunk bound: the p2p scratch zone is the TOP quarter of the pool
-        # (pool/4 - flag tail; allreduce keeps the bottom half), 1 MiB margin
-        chunk = min(_CHUNK, (max(self._pool_mb // 4 - 1, 1)) << 20)
+        # (pool/4 - flag tail; allreduce keeps the bottom half), 1 MiB margin.
+        # NOTE: a single chunk is the largest unit the p2p path handles
+        # reliably on this platform -- multi-chunk full-duplex exchanges hit
+        # an unresolved flag-delivery pathology (~4.4s context death, see
+        # BUILD_AND_TEST.md §10), so the chunk is sized to the whole zone
+        # and large messages ride ONE chunk (slow but correct: BAR write
+        # completion is ack-paced at ~10 MB/s under load).
+        chunk = (max(self._pool_mb // 4 - 1, 1)) << 20
         peer = 1 - self.rank()
         if nbytes <= chunk:
             if send:
@@ -303,6 +329,7 @@ class BarlinkBackend(_C10D.Backend):
                 bl.recv_into(c, peer)
 
     def _send_impl(self, t):
+        self._dbg("send_impl", tuple(t.shape), t.dtype)
         if self._zc_p2p_usable(t):
             self._p2p_zerocopy(t, send=True)
             return
@@ -318,6 +345,7 @@ class BarlinkBackend(_C10D.Backend):
         bl.send_into(sbuf, 1 - self.rank())
 
     def _recv_impl(self, t):
+        self._dbg("recv_impl", tuple(t.shape), t.dtype)
         if self._zc_p2p_usable(t):
             self._p2p_zerocopy(t, send=False)
             return
@@ -335,6 +363,7 @@ class BarlinkBackend(_C10D.Backend):
 
     # -- collectives: all_gather ------------------------------------------
     def all_gather_single(self, output, input, opts):
+        self._dbg("all_gather_single", tuple(input.shape), input.dtype)
         # output: [world * n] contiguous; input: [n]. rank r's slice at
         # [r*n:(r+1)*n]. SPMD: both ranks copy locally, then exchange
         # their slices through the p2p path (full duplex).
