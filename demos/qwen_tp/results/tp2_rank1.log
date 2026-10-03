@@ -1,0 +1,7 @@
+[rank1]:W1004 00:18:51.610000 110029 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:W1004 00:18:51.628000 110029 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+L0 z: out=3072 qweight=(3072, 5120) b_out=24
+[tp=2 barlink rank=1] load=0s peak=15.0 GiB
+prompt tokens: 18
+[tp=2 barlink rank=1] 50 tokens in 5.18s = 9.65 tok/s
+SAMPLE:  the explanation of GPU P2P communication over PCIe BAR1:  1.  **Deconstruct the Request:**     *   **Topic:** GPU Peer-to-Peer (P2P) communication.     *   **Specific Mechanism

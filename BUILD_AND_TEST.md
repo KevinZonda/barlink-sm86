@@ -362,3 +362,56 @@ rel_l2 = 0.0；两 rank 加法都在 fp32 域一次舍入，与 NCCL bf16 SUM �
   p2p；barlink PG 未实现 all_gather）。
 - run.sh 的后台管道不能 `| tee`（`$!` 是 tee 的 pid，真实退出码丢失，曾把
   崩溃的 phase 标成 OK）；日志直写文件。
+
+## 10. Qwen3.5-27B-GPTQ-Int4 TP=2 decode：barlink PG vs NCCL（2026-10-04）
+
+模型 `/mnt/modelzoo/Qwen/Qwen3.5-27B-GPTQ-Int4`（hf-mirror 被限速到 ~116 KB/s
+不可用时走 ModelScope）。混合架构：64 层 = 48 GatedDeltaNet 线性注意力 +
+16 全注意力，hidden 5120，vocab 248320。**checkpoint 只有 MLP 是 GPTQ int4**
+（qweight v1 布局 [in/8, out]，group 128 sym，desc_act=False），其余 bf16
+——bf16 部分单卡 20 GB 放不下。代码 `demos/qwen_tp/`（worker.py + 自写
+int4linear.py，run.sh 三模式，results/ 存档）。
+
+**实现**（stock GPTQ 路径在本栈全灭：HF quantizer 丢弃 checkpoint 的
+dynamic 排除项把 attention 转成随机初始化的 QuantLinear；gptqmodel 原生
+loader 单卡 >20 GB；CPU 后端 torch_aten 每次 forward 反量化）：
+- 完全手动加载：meta 设备建骨架 + safetensors 逐 tensor 拉取（跳过
+  vision/mtp），量化器整体绕开
+- MLP：checkpoint 原始 int4 张量直接喂自写 Triton int4 GEMV（v1 布局原样，
+  TP 切分在 group 边界上 = 量化值的精确子集；BN128/BK256/SPLIT2 调优后
+  544 GB/s eff，71% HBM 峰值）
+- 其余 Linear：动态 W8A8 int8（torch._int_mm IMMA，权重 9 GB；m≤16 时 pad
+  到 32）；embedding int8 行量化。两侧（TP1/TP2、两 rank）权重逐位一致，
+  输出只差归约重关联
+- GatedDeltaNet 走 transformers 5.18 + fla/causal-conv1d 原生 kernel
+
+**延迟**（greedy，prompt 18 tok，纯 decode 计时，50 tok 均值，双 3080）：
+
+| 配置 | tok/s | 峰值显存 |
+|---|---|---|
+| TP=1 | **10.19** | 17.4 GiB |
+| TP=2 barlink PG（零拷贝） | 9.65 | ~10 GiB/卡 |
+| TP=2 NCCL（SHM） | 9.58 | ~10 GiB/卡 |
+
+每 token 128 次 10KB rowwise allreduce。**结论：eager 执行下 TP=2 无加速、
+两后端无差异**——torch.profiler 实测每 token ~1200 个 kernel launch，
+host 派发 + launch 间隙 ~60 ms，远超 GPU 计算（TP=1 50 ms，TP=2 每 rank
+38 ms）；TP 只减半 GPU 侧工作，固定 per-op 成本（eager glue、int8 GEMV
+固定开销、同步等待）不减。barlink 25 µs vs NCCL 49 µs 的 per-op 优势
+（§7）在本负载仅占 3-6%。与 §9（Qwen3.8 int8，同架构同结论）互相印证：
+**下一步必须是 CUDA graphs / 编译化执行**才能把 TP 收益和 barlink 延迟
+优势兑现（graphs 化后 allreduce 占比升至主导，零拷贝路径直接受益）。
+注：barlink 的 allreduce 协议 kernel 数多（6/op），graphs 化时 barlink
+侧还需要把 seq 计数器做成可注入参数（当前烘焙在 kernel 参数里）。
+
+**正确性**：TP=2 两 rank 输出逐 token 一致（True）；vs TP=1 前 46 token
+完全一致、第 47 token greedy 翻转（int8 噪声下近邻并列），token match
+94%（判据 ≥90% + rank 一致，`results/correctness_*.json`）。
+
+**core 改动**：`k_flag_wait` 的 `__nanosleep` 退避（原 cap 1 ms）换成纯
+自旋——flag 在本地内存，轮询不耗链路带宽，而 `__nanosleep` 会向上取整到
+计时器 tick，把 decode-TP 的每次等待放大到数百 µs。PG 微基准不变
+（10KB 24.9 µs），run_pg.sh / FLUX2 demo 全套回归通过。
+
+运行：`bash demos/qwen_tp/run.sh [tp1|barlink|nccl]`（等卡窗口+重试；
+worker 加载期间持有 15 GiB 显存占位防其它实验插队）。

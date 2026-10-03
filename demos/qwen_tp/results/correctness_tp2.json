@@ -1,0 +1,8 @@
+{
+  "tp2_tag": "tp2",
+  "token_match_rate": 0.9399999976158142,
+  "n_compared": 50,
+  "first_divergence": 47,
+  "rank_consistent": true,
+  "passed": true
+}

@@ -1,0 +1,14 @@
+{
+  "tp": 1,
+  "backend": null,
+  "prompt": "Explain how GPU P2P communication over PCIe BAR1 works, in technical detail.",
+  "prompt_tokens": 18,
+  "gen_tokens": 50,
+  "warmup_tokens": 10,
+  "greedy": true,
+  "tok_per_s": 10.194385110101528,
+  "seconds": 4.904660699001397,
+  "peak_mem_gib": 17.40079402923584,
+  "load_s": 0.1622638702392578,
+  "sample": " the explanation of GPU P2P communication over PCIe BAR1:\n\n1.  **Deconstruct the Request:**\n    *   **Topic:** GPU Peer-to-Peer (P2P) communication.\n    *   **Mechanism:**"
+}

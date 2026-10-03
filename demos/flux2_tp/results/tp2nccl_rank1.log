@@ -1,1 +1,41 @@
-[tp=2 rank=1] load=0.0s shard=114 ms | 10 steps: mean=918.2 ms/step min=916.0 max=922.1 | peak_mem=16.9 GiB
+[rank1]:W1004 00:23:14.115000 110841 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:W1004 00:23:14.138000 110841 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:[W1004 00:23:21.558194894 CUDACachingAllocator.cpp:528] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8126464, total: 21027028992).
+[rank1]:[W1004 00:23:21.560240008 CUDACachingAllocator.cpp:528] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8126464, total: 21027028992).
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/demos/flux2_tp/worker.py", line 199, in <module>
+[rank1]:     main()
+[rank1]:     ~~~~^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/demos/flux2_tp/worker.py", line 102, in main
+[rank1]:     model = model.to(dev).eval()
+[rank1]:             ~~~~~~~~^^^^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/diffusers/models/modeling_utils.py", line 1550, in to
+[rank1]:     return super().to(*args, **kwargs)
+[rank1]:            ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1388, in to
+[rank1]:     return self._apply(convert)
+[rank1]:            ~~~~~~~~~~~^^^^^^^^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+[rank1]:     module._apply(fn)
+[rank1]:     ~~~~~~~~~~~~~^^^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+[rank1]:     module._apply(fn)
+[rank1]:     ~~~~~~~~~~~~~^^^^
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 933, in _apply
+[rank1]:     module._apply(fn)
+[rank1]:     ~~~~~~~~~~~~~^^^^
+[rank1]:   [Previous line repeated 1 more time]
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 966, in _apply
+[rank1]:     param_applied = fn(param)
+[rank1]:   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1374, in convert
+[rank1]:     return t.to(
+[rank1]:            ~~~~^
+[rank1]:         device,
+[rank1]:         ^^^^^^^
+[rank1]:         dtype if t.is_floating_point() or t.is_complex() else None,
+[rank1]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:         non_blocking,
+[rank1]:         ^^^^^^^^^^^^^
+[rank1]:     )
+[rank1]:     ^
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 128.00 MiB. GPU 0 has a total capacity of 19.58 GiB of which 87.75 MiB is free. Process 110806 has 11.48 GiB memory in use. Including non-PyTorch memory, this process has 8.01 GiB memory in use. Of the allocated memory 7.78 GiB is allocated by PyTorch, and 10.98 MiB is reserved by PyTorch but unallocated.

@@ -1,1 +1,3 @@
-[tp=2 rank=1] load=0.0s shard=116 ms | 10 steps: mean=896.4 ms/step min=891.5 max=905.7 | peak_mem=16.9 GiB
+[rank1]:W1004 00:24:36.162000 111296 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:W1004 00:24:36.181000 111296 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[tp=2 rank=1] load=0.0s shard=126 ms | 10 steps: mean=902.7 ms/step min=900.7 max=905.2 | peak_mem=16.9 GiB

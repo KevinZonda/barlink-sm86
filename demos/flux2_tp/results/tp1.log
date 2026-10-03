@@ -1,1 +1,5 @@
-[tp=1 rank=0] load=0.0s shard=n/a | 10 steps: mean=1393.3 ms/step min=1384.6 max=1401.7 | peak_mem=17.7 GiB
+W1004 00:24:08.087000 111189 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1004 00:24:08.106000 111189 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 208.68it/s]
+[tp=1 rank=0] load=0.0s shard=n/a | 10 steps: mean=1413.5 ms/step min=1406.4 max=1420.1 | peak_mem=17.7 GiB

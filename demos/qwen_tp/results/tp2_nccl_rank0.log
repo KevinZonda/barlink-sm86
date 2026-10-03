@@ -1,0 +1,10 @@
+[rank0]:W1004 00:21:00.747000 110404 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank0]:W1004 00:21:00.766000 110404 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+L0 z: out=3072 qweight=(3072, 5120) b_out=24
+gate_proj: Int4Linear qweight=(640, 8704) scales=(40, 8704)
+[tp=2 nccl rank=0] load=0s peak=15.0 GiB
+prompt tokens: 18
+[tp=2 nccl rank=0] 50 tokens in 5.22s = 9.58 tok/s
+SAMPLE:  the explanation of GPU P2P communication over PCIe BAR1:  1.  **Deconstruct the Request:**     *   **Topic:** GPU Peer-to-Peer (P2P) communication.     *   **Specific Mechanism
+/home/kevin/projects/nv-p2p/barlink-torch/.venv/lib/python3.14/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)

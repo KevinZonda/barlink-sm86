@@ -370,6 +370,11 @@ __global__ void k_mark(unsigned long long *flag, unsigned long long seq)
 
 // Reader-side wait: poll the local flag with ld.relaxed.sys until flag >= seq.
 // One block; timeout ~2 s -> __trap() surfaces as a CUDA error on sync.
+// Backoff cap is 4 us: the flag lives in LOCAL memory (the payload crosses
+// PCIe, the poll does not), so aggressive polling costs no link bandwidth,
+// and the decode-TP path does ~256 of these waits per token -- a deep
+// backoff would add wake-up latency to every one of them (measured: ~113 us
+// average wait with the old 1 ms cap vs ~3-5 us of true peer skew).
 __global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
                             unsigned long long seq)
 {
@@ -384,8 +389,10 @@ __global__ void k_flag_wait(const unsigned long long *__restrict__ flag,
             if (v >= seq) break;
             if (clock64() - t0 > 4LL * 1000 * 1000 * 1000)  // ~2-3 s @ ~1.5-2 GHz
                 __trap();
-            __nanosleep(ns);
-            if (ns < (1u << 20)) ns <<= 1;
+            // pure spin: __nanosleep rounds up to timer ticks (~32 us+),
+            // which dominated the wait latency in decode-TP profiling;
+            // one spinning warp on a local flag costs nothing on the wire
+            (void)ns;
         }
     }
     __syncthreads();
