@@ -30,6 +30,16 @@ def seeded(seed, n, dtype=torch.float32):
     return t.to(dtype)
 
 
+def ref_sum(a, b, dtype):
+    # reference a+b with torch compute semantics: fp8 adds on CPU are not
+    # implemented, and torch computes fp8/fp16/bf16 elementwise adds with
+    # float opmath and one rounding -- which is exactly the pool/zero-copy
+    # kernel rule (add in float, round back).
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return (a.to(torch.float32) + b.to(torch.float32)).to(dtype)
+    return a + b
+
+
 def check(t, want, tag, rank):
     if not torch.equal(t.cpu(), want.cpu()):
         bad = (t.cpu() != want.cpu()).sum().item()
@@ -54,7 +64,8 @@ def main():
 
     def allreduce_case(n, dtype, tag):
         t = seeded(my_seed + n, n, dtype).to(dev)
-        want = seeded(my_seed + n, n, dtype) + seeded(peer_seed + n, n, dtype)
+        want = ref_sum(seeded(my_seed + n, n, dtype),
+                       seeded(peer_seed + n, n, dtype), dtype)
         dist.all_reduce(t)
         check(t, want.to(dtype), tag, rank)
 
@@ -63,10 +74,46 @@ def main():
     allreduce_case(256 * 1024, torch.float32, "all_reduce fp32 1MB")
     allreduce_case(8 * 1024 * 1024, torch.float32, "all_reduce fp32 32MB")
 
-    # 2. dtypes: bf16 / fp64 native, fp16 via fp32 staging
+    # 2. dtypes: bf16 / fp64 native, fp16 (now native on the zero-copy path),
+    #    fp64 native, fp8 x2
     allreduce_case(65536, torch.bfloat16, "all_reduce bf16")
     allreduce_case(32768, torch.float64, "all_reduce fp64")
-    allreduce_case(65536, torch.float16, "all_reduce fp16 (fp32 staging)")
+    allreduce_case(65536, torch.float16, "all_reduce fp16 (zero-copy native)")
+    allreduce_case(65536, torch.float8_e4m3fn, "all_reduce fp8_e4m3fn")
+    allreduce_case(65536, torch.float8_e5m2, "all_reduce fp8_e5m2")
+
+    # 2b. zero-copy path edge shapes: odd-element fp16 (multiple of 16
+    # bytes), in-place semantics on a non-pool torch allocation of each
+    # supported dtype
+    for dt in (torch.float16, torch.bfloat16, torch.float32, torch.float64,
+               torch.float8_e4m3fn, torch.float8_e5m2):
+        n = 12 * (16 // dt.itemsize)   # 12 uint4 lanes
+        t = seeded(my_seed + 5, n, dt).to(dev)
+        want = ref_sum(seeded(my_seed + 5, n, dt),
+                       seeded(peer_seed + 5, n, dt), dt)
+        dist.all_reduce(t)
+        check(t, want.to(dt), "zero-copy %s" % dt, rank)
+
+    # 2c. direct binding: bl.allreduce_into on plain torch tensors
+    import barlink_sm86 as bl
+    n = 65536
+    tin = seeded(my_seed + 6, n, torch.float32).to(dev)
+    tout = tin.clone()
+    bl.allreduce_into(tout, tin)
+    want = seeded(my_seed + 6, n, torch.float32) + \
+        seeded(peer_seed + 6, n, torch.float32)
+    check(tout, want.to(torch.float32), "bl.allreduce_into", rank)
+
+    # 2d. unaligned fp16 falls back to the staging cast path (data_ptr not
+    # 16-aligned, size still a multiple of 16 bytes)
+    base = seeded(my_seed + 78, 65536 + 8, torch.float16).to(dev)
+    tu = base[1:]                       # 2-byte-misaligned view (still 131072 B)
+    assert tu.data_ptr() % 16 != 0
+    want = seeded(my_seed + 78, 65536 + 8, torch.float16)[1:] + \
+        seeded(peer_seed + 78, 65536 + 8, torch.float16)[1:]
+    dist.all_reduce(tu)
+    check(tu, want.to(torch.float16), "all_reduce fp16 unaligned (staging fallback)", rank)
+
 
     # 3. odd sizes: not a multiple of 16 bytes (999 floats = 3996 B)
     allreduce_case(999, torch.float32, "all_reduce fp32 3996B (non-16)")

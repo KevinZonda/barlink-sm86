@@ -1,0 +1,10 @@
+rank 0: PG all_reduce 10240 B: 99.8 us (event), 107.4 us (sync)
+rank 0: PG all_reduce 65536 B: 104.0 us (event), 112.6 us (sync)
+rank 0: PG all_reduce 262144 B: 123.0 us (event), 132.6 us (sync)
+rank 0: PG all_reduce 1048576 B: 209.4 us (event), 219.5 us (sync)
+SUMMARY size event_us sync_us
+SUMMARY 10240 99.8 107.4
+SUMMARY 65536 104.0 112.6
+SUMMARY 262144 123.0 132.6
+SUMMARY 1048576 209.4 219.5
+PG LAT BENCH DONE

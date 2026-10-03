@@ -142,11 +142,21 @@ BAR1 直连（kernel 写对端 BAR，`--both` 两方向取一）vs stock 580（�
 ```python
 from barlink_sm86 import process_group as blpg
 blpg.init_process_group(init_method="tcp://127.0.0.1:29500", rank=r, world_size=2)
-dist.all_reduce(tensor)        # SUM；fp32/fp64/bf16 原生，fp16 经 fp32 staging
+dist.all_reduce(tensor)        # SUM；连续对齐的 CUDA tensor 走零拷贝路径
+                               # （fp16/bf16/fp32/fp64/fp8），其余经 pool staging
+```
+
+底层新原语（peer 模式，直接读写用户 tensor，无 staging 拷贝、无 host sync）：
+
+```python
+bl.allreduce_into(out, in)     # out = in + peer_in；in==out（原地）或完全不重叠
+                               # fp16 原生（float opmath 加一次舍入，与 torch 一致）
+                               # u8 不支持（保持 mod-256 pool 语义，走 allreduce_）
 ```
 
 ```bash
 bash torch_ext/tests/run_pg.sh    # 两进程全流程测试（allreduce/broadcast/barrier/复用/错误路径）
+bash bench/latency/run_pg_lat.sh  # PG 层延迟 bench（10KB/64KB/256KB/1MB）
 ```
 
 环境变量：`BL_POOL_MB`（默认 64，PG 测试用 192 跑 96 MiB 分块路径）、`BL_SOCK_PATH`
@@ -157,8 +167,11 @@ bash torch_ext/tests/run_pg.sh    # 两进程全流程测试（allreduce/broadca
 
 - **world_size 必须是 2**（底层链路双卡专用）；creator 里直接报错
 - **allreduce 只支持 ReduceOp.SUM**；dtype 支持 fp32/fp64/bf16/fp16/fp8×2/u8，其余 raise
-- **同步语义**：collective 返回 None 表示已排队，完成性由 current stream 的后续
+- **同步语义**：collective 返回已完成的 Work（单例），完成性由 current stream 的后续
   enqueue/sync 保证，不是 host 同步
+- **零拷贝路径条件**：CUDA + contiguous + 16 字节对齐指针 + 字节数非零 16 倍数 +
+  ≤ peer scratch zone（pool/2 − flag tail，PG 层自动分块）；不满足则回退 pool
+  staging（u8、非连续、非对齐、CPU tensor 都走这条）
 - send/recv/all_gather/reduce_scatter 未实现（vLLM/DiT v1 用不到），调用 raise
   NotImplementedError
 - subgroup（new_group 小于 world）不支持：后端是单例复用同一条链路，SPMD 纪律要求
@@ -166,18 +179,26 @@ bash torch_ext/tests/run_pg.sh    # 两进程全流程测试（allreduce/broadca
 - **torchrun 启动拿不到 CAP_SYS_ADMIN**（file cap 不跨 execve 传递），workaround：
   继续用 `tools/blrun` 直启两个进程（`tests/run_pg.sh` 就是模板），不要 torchrun
 
-实测 PG 层 all_reduce 延迟（双 3080，2026-10-03，pool 192 MiB，50 次平均，
-raw bl 链路 ≤64 KiB 是 22-26 µs）：
+实测 PG 层 all_reduce 延迟（双 3080，2026-10-03，pool 192 MiB，50 次 event 计时
+back-to-back；raw bl 链路 ≤64 KiB 是 22-26 µs；`bench/latency/run_pg_lat.sh`）：
 
-| size | PG all_reduce |
-|---|---|
-| 10 KB | 92 µs |
-| 64 KB | 96 µs |
-| 256 KB | 117 µs |
-| 1 MB | 205 µs |
+| size | 零拷贝前 | 零拷贝后 | 提升 |
+|---|---|---|---|
+| 10 KB | 92 µs | **25 µs** | 3.7× |
+| 64 KB | 96 µs | **23 µs** | 4.2× |
+| 256 KB | 117 µs | **43 µs** | 2.7× |
+| 1 MB | 205 µs | **129 µs** | 1.6× |
 
-PG 层比 raw bl 多出的 ~70 µs 固定开销 = staging 填充/回拷（两次 D2D copy）+
-Python/trampoline 调度；带宽项（>256 KB 后每翻倍 +~90 µs ≈ 12 GB/s 链路速度）一致。
+零拷贝协议：单 payload（kernel 直读用户 `in`，st.global.wt 写 peer scratch 固定
+偏移）+ 本地 add kernel 直写 `out`（scratch 侧 ld.relaxed.sys 读），arm/完成
+flag 协议不变，全程 stream-ordered、无 host sync、无 pool 中转。剩下 ~25 µs =
+c10d trampoline + 6 个 kernel launch（arm/armwait/payload/mark/flagwait/add）+
+flag 可见性（~3 µs×2）。大消息带宽不退化：32 MB/op 时 8.1 GB/s/方向 = 链路双向
+聚合 ~17 GB/s 的单方向份额（平台上限），raw bl 数字不变（`trials/` 有留底：
+`c19abd8-pre-zerocopy/` vs `zerocopy/`）。
+
+历史留档：零拷贝前 PG 层比 raw bl 多出的 ~70 µs 固定开销 = staging 填充/回拷
+（两次 D2D copy）+ Python/trampoline 调度。
 
 ## 8. FLUX.2 Klein 9B DiT 张量并行 demo（2026-10-03）
 
@@ -196,14 +217,14 @@ forward，CUDA event 计时，10 步（先 3 步 warmup）。
 
 | 配置 | ms/step (mean, min–max) | 峰值显存 |
 |---|---|---|
-| TP=1（单卡全模型） | 1401.3 (1391.9–1410.3) | 17.7 GiB |
-| TP=2（barlink PG） | 927.1 (922.3–929.7) | 16.9 GiB（含切分前的全量副本） |
+| TP=1（单卡全模型） | 1393.3 (1384.6–1401.7) | 17.7 GiB |
+| TP=2（barlink PG，零拷贝） | 896.4 (891.5–905.7) | 16.9 GiB（含切分前的全量副本） |
 
-**加速比 1.51×**（token 数 4096+512，batch 1，bf16，2026-10-03 实测）。
+**加速比 1.55×**（token 数 4096+512，batch 1，bf16，2026-10-03 实测；
+零拷贝 PG 前 TP=2 为 927.1 ms/step = 1.51×，见 git 历史）。
 每 step 有 56 次 rowwise allreduce（8 double block × 4 + 24 single block × 1），
-通信量 ~1.5 GB/step（最大消息 37.7 MB，double block img 侧 33.5 MB）。
-理想算力减半对应 700 ms，实际 927 ms —— 差额 ~230 ms 即通信暴露 +
-每 rank 显存减半收益未计入算力（kernel launch、访存模式变化）。
+通信量 ~1.5 GB/step（最大消息 37.7 MB，double block img 侧 33.5 MB），全部走
+零拷贝路径（bf16、连续、对齐、单块直达）。
 
 正确性（同 seed 输入，TP1 vs TP2 输出）：
 

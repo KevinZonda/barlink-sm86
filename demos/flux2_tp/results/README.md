@@ -6,12 +6,12 @@ inference_mode forward，CUDA event 计时，10 步（3 步 warmup）。
 
 | 配置 | ms/step mean (min–max) | 峰值显存 |
 |---|---|---|
-| TP=1 | 1401.3 (1391.9–1410.3) | 17.7 GiB |
-| TP=2 (barlink PG) | 927.1 (922.3–929.7) | 16.9 GiB |
+| TP=1 | 1393.3 (1384.6–1401.7) | 17.7 GiB |
+| TP=2 (barlink PG, zero-copy) | 896.4 (891.5–905.7) | 16.9 GiB |
 
-加速比 1.51×。正确性：cosine 0.9998，rel_L2 1.77%，anchor（fp32 计算）噪声
-底 TP1 2.31% / TP2 2.42% → PASS。详见 BUILD_AND_TEST.md §8 与
-correctness.json。
+加速比 1.55×（零拷贝 PG 前 927.1 ms/step = 1.51×）。正确性：cosine 0.9998，
+rel_L2 1.77%，anchor（fp32 计算）噪声底 TP1 2.31% / TP2 2.42% → PASS。
+判据与论证见 BUILD_AND_TEST.md §8 与 correctness.json。
 
 文件：
 - `stats_tp{1,2}.json` / `stats_tp2anchor.json`：每步时间与配置

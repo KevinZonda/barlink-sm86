@@ -52,6 +52,22 @@ static int dtypeEnumFor(at::ScalarType st)
     }
 }
 
+// Zero-copy path dtypes: everything EXCEPT u8 (keeps the mod-256 pool
+// semantics; PG SUM does not expose it). fp16 is native here -- no pool
+// add-dtype requirement -- which retires the fp32-staging cast workaround.
+static int dtypeEnumZeroCopy(at::ScalarType st)
+{
+    switch (st) {
+    case at::kHalf:          return BL_DTYPE_FP16;
+    case at::kFloat:         return BL_DTYPE_FP32;
+    case at::kDouble:        return BL_DTYPE_FP64;
+    case at::kBFloat16:      return BL_DTYPE_BF16;
+    case at::kFloat8_e4m3fn: return BL_DTYPE_FP8E4M3;
+    case at::kFloat8_e5m2:   return BL_DTYPE_FP8E5M2;
+    default:                 return -1;
+    }
+}
+
 static void checkPoolPtr(const at::Tensor &t, int *idxOut, void **ptrOut)
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -262,6 +278,50 @@ void allreduce_(at::Tensor a, at::Tensor b)
                           (void *)sA, (void *)sB, err, sizeof(err)), err);
 }
 
+void allreduce_into(at::Tensor out, at::Tensor in)
+{
+    TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
+    TORCH_CHECK(g_peer,
+                "barlink_sm86 allreduce_into: peer (cross-process) mode only");
+    TORCH_CHECK(in.is_cuda() && out.is_cuda(),
+                "barlink_sm86 allreduce_into: tensors must be CUDA tensors");
+    TORCH_CHECK(in.is_contiguous() && out.is_contiguous(),
+                "barlink_sm86 allreduce_into: tensors must be contiguous");
+    TORCH_CHECK(in.scalar_type() == out.scalar_type(),
+                "barlink_sm86 allreduce_into: dtype mismatch");
+    int dt = dtypeEnumZeroCopy(in.scalar_type());
+    TORCH_CHECK(dt >= 0,
+                "barlink_sm86 allreduce_into: unsupported dtype ",
+                in.scalar_type(),
+                " (supported: float16, bfloat16, float32, float64, "
+                "float8_e4m3fn, float8_e5m2; u8 keeps the pool path)");
+    TORCH_CHECK(in.numel() == out.numel(),
+                "barlink_sm86 allreduce_into: size mismatch");
+    size_t bytes = (size_t)in.numel() * in.element_size();
+    TORCH_CHECK(bytes > 0 && bytes % 16 == 0,
+                "barlink_sm86 allreduce_into: byte size must be a non-zero "
+                "multiple of 16");
+    TORCH_CHECK(in.get_device() == g_devices[g_myRank],
+                "barlink_sm86 allreduce_into: tensor must live on this "
+                "rank's device (cuda:", g_devices[g_myRank], ")");
+    uintptr_t ip = (uintptr_t)in.data_ptr(), op = (uintptr_t)out.data_ptr();
+    TORCH_CHECK(ip % 16 == 0 && op % 16 == 0,
+                "barlink_sm86 allreduce_into: data pointers must be 16-byte "
+                "aligned (fresh torch allocations are)");
+    if (ip != op) {
+        TORCH_CHECK(ip + bytes <= op || op + bytes <= ip,
+                    "barlink_sm86 allreduce_into: overlapping in/out ranges "
+                    "are only supported for in-place (in == out)");
+    }
+
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(
+        in.get_device()).stream();
+    c10::cuda::CUDAGuard guard(in.get_device());
+    char err[BL_ERRBUF] = {0};
+    blCheck(bl_allreduce_into_peer(g_ctx, (void *)ip, (void *)op, bytes, dt,
+                                   (void *)s, err, sizeof(err)), err);
+}
+
 int64_t verify()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -302,6 +362,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("dtype") = py::none());
     m.def("copy_", &copy_, py::call_guard<py::gil_scoped_release>());
     m.def("allreduce_", &allreduce_, py::call_guard<py::gil_scoped_release>());
+    m.def("allreduce_into", &allreduce_into, py::arg("out"), py::arg("in"),
+          py::call_guard<py::gil_scoped_release>());
     m.def("verify", &verify, py::call_guard<py::gil_scoped_release>());
     m.def("readback", &readback, py::call_guard<py::gil_scoped_release>());
 }

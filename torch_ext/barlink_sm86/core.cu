@@ -509,6 +509,11 @@ __device__ __forceinline__ static __nv_bfloat16 blElemAdd(__nv_bfloat16 a,
 {
     return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
 }
+// torch computes half elementwise ops with float opmath and rounds once.
+__device__ __forceinline__ static __half blElemAdd(__half a, __half b)
+{
+    return __float2half(__half2float(a) + __half2float(b));
+}
 
 // NOTE: passing __nv_fp8_e4m3/e5m2 BY VALUE through device functions is
 // silently miscompiled by nvcc 13.4 at -O2 for sm_86 (1-byte class ABI;
@@ -578,6 +583,91 @@ static int launchAdd(int dtype, uint4 *a, const uint4 *b, size_t n4,
     case BL_DTYPE_BF16:    k_add_t<__nv_bfloat16><<<blocks, 256, 0, stream>>>(a, b, n4); break;
     case BL_DTYPE_FP8E4M3: k_add_fp8<__NV_E4M3><<<blocks, 256, 0, stream>>>(a, b, n4); break;
     case BL_DTYPE_FP8E5M2: k_add_fp8<__NV_E5M2><<<blocks, 256, 0, stream>>>(a, b, n4); break;
+    default: return -1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy allreduce add kernels: out[i] = elemAdd(in[i], scr[i]).
+// 'scr' holds the PEER's contribution, written through the BAR (inbound PCIe
+// writes) -- read it with ld.relaxed.sys like every inbound-written buffer.
+// 'in'/'out' are plain local device memory (arbitrary torch tensors), so
+// 'in' uses plain loads and 'out' plain stores. in == out (in-place) is
+// fine: each element is read (in and scr) exactly once before being written.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void k_add_into_t(uint4 *__restrict__ out,
+                             const uint4 *__restrict__ in,
+                             const uint4 *__restrict__ scr, size_t n4)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = in[i];
+        uint4 y = ldcs128(&scr[i]);
+        const T *xp = reinterpret_cast<const T *>(&x);
+        const T *yp = reinterpret_cast<const T *>(&y);
+        uint4 s;
+        T *sp = reinterpret_cast<T *>(&s);
+#pragma unroll
+        for (int k = 0; k < (int)(16 / sizeof(T)); ++k)
+            sp[k] = blElemAdd(xp[k], yp[k]);
+        out[i] = s;
+    }
+}
+
+// fp8 zero-copy add on raw storage (same by-value miscompile workaround as
+// k_add_fp8).
+template <__nv_fp8_interpretation_t INTERP>
+__global__ void k_add_into_fp8(uint4 *__restrict__ out,
+                               const uint4 *__restrict__ in,
+                               const uint4 *__restrict__ scr, size_t n4)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = in[i];
+        uint4 y = ldcs128(&scr[i]);
+        const __nv_fp8_storage_t *xp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&x);
+        const __nv_fp8_storage_t *yp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&y);
+        uint4 s;
+        __nv_fp8_storage_t *sp =
+            reinterpret_cast<__nv_fp8_storage_t *>(&s);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float fa = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(xp[k], INTERP)));
+            float fb = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(yp[k], INTERP)));
+            sp[k] = __nv_cvt_float_to_fp8(fa + fb, __NV_SATFINITE, INTERP);
+        }
+        out[i] = s;
+    }
+}
+
+// Dispatch for the zero-copy add. fp16 is native here -- the whole point of
+// the zero-copy path is that it needs no pool-resident add dtype.
+static int launchAddInto(int dtype, uint4 *out, const uint4 *in,
+                         const uint4 *scr, size_t n4, size_t blocks,
+                         cudaStream_t stream)
+{
+    switch (dtype) {
+    case BL_DTYPE_FP16:    k_add_into_t<__half><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
+    case BL_DTYPE_FP32:    k_add_into_t<float><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
+    case BL_DTYPE_FP64:    k_add_into_t<double><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
+    case BL_DTYPE_BF16:    k_add_into_t<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
+    case BL_DTYPE_FP8E4M3: k_add_into_fp8<__NV_E4M3><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
+    case BL_DTYPE_FP8E5M2: k_add_into_fp8<__NV_E5M2><<<blocks, 256, 0, stream>>>(
+                               out, in, scr, n4); break;
     default: return -1;
     }
     return 0;
@@ -2164,6 +2254,112 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     // v1: conservative drain. The scratch zone is shared with verify/copy
     // traffic and the free would need cross-process agreement.
     cudaDeviceSynchronize();
+    return 0;
+}
+
+extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
+                                      void *outPtr, size_t bytes, int dtype,
+                                      void *stream, char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode || !inPtr || !outPtr || bytes == 0 ||
+        bytes % 16 != 0) {
+        setErr(err, errlen,
+               "bl_allreduce_into_peer: bad argument (non-null pointers, "
+               "size a non-zero multiple of 16)");
+        return -1;
+    }
+    if (dtype <= BL_DTYPE_U8 || dtype > BL_DTYPE_FP16) {
+        setErr(err, errlen,
+               "bl_allreduce_into_peer: unsupported dtype (u8 keeps the "
+               "mod-256 pool path; use bl_allreduce_peer)");
+        return -1;
+    }
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+    if (((uintptr_t)inPtr | (uintptr_t)outPtr) % 16 != 0) {
+        setErr(err, errlen,
+               "bl_allreduce_into_peer: in/out must be 16-byte aligned "
+               "(fresh torch allocations are)");
+        return -1;
+    }
+    const size_t scratchAvail =
+        myP.size - BL_FLAG_REGION - ctx->scratchBase;
+    if (bytes > scratchAvail) {
+        setErr(err, errlen,
+               "bl_allreduce_into_peer: size exceeds the peer scratch zone "
+               "(pool/2 - flag tail); chunk larger tensors at the caller");
+        return -1;
+    }
+    void *bar = pathDevPtr(ctx, peer, me);
+    if (!bar) {
+        setErr(err, errlen, "bl_allreduce_into_peer: no BAR1 write path");
+        return -1;
+    }
+
+    // ONE seq per call per rank, one payload: my 'in' goes to the peer's
+    // scratch zone at the FIXED offset scratchBase. Reusing that offset on
+    // every call is safe under the SPMD discipline: my next payload is
+    // stream-ordered after my arm-wait, which the peer only arms after its
+    // add kernel (this call's scratch consumer) was enqueued on its stream.
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        seq = ++ctx->dirSeq[me];
+        ctx->lastIncoming[me] = seq;
+    }
+
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_into_peer: cudaSetDevice failed");
+        return -1;
+    }
+    const size_t n4 = bytes / 16;
+    uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
+    cudaStream_t s = (cudaStream_t)stream;
+
+    // arm handshake (same protocol as bl_allreduce_peer)
+    k_mark<<<1, 1, 0, s>>>(
+        (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me) + 8),
+        seq);
+    k_flag_wait<<<1, 32, 0, s>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, peer) + 8), seq);
+
+    // single payload: read MY 'in' (plain local loads), st.global.wt into
+    // the peer's scratch; one completion mark covers it
+    k_copy<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+        (const uint4 *)inPtr, (uint4 *)peerScratch, n4);
+    k_mark<<<1, 1, 0, s>>>(
+        (unsigned long long *)((uint8_t *)bar + flagOff(ctx->pools[peer], me)),
+        seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_into_peer: kernel launch failed");
+        return -1;
+    }
+
+    // reader wait on MY completion flag, then the add writes 'out' directly
+    // -- no pool->tensor copy back. Fully stream-ordered; NO host sync.
+    unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, peer));
+    k_flag_wait<<<1, 32, 0, s>>>(myFlag, seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen,
+               "bl_allreduce_into_peer: flag-wait launch failed");
+        return -1;
+    }
+
+    const uint4 *scr = (const uint4 *)(uintptr_t)(
+        myP.dptr + ctx->scratchBase);
+    if (launchAddInto(dtype, (uint4 *)outPtr, (const uint4 *)inPtr, scr, n4,
+                      gridBlocks(n4, myOrd), s) != 0) {
+        setErr(err, errlen, "bl_allreduce_into_peer: bad dtype (internal)");
+        return -1;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_into_peer: add kernel launch failed");
+        return -1;
+    }
     return 0;
 }
 

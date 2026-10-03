@@ -53,6 +53,7 @@ shutdown = _C.shutdown
 empty = _C.empty
 copy_ = _C.copy_
 allreduce_ = _C.allreduce_
+allreduce_into = _C.allreduce_into
 verify = _C.verify
 readback = _C.readback
 
@@ -99,4 +100,5 @@ def allreduce_large(a, b, chunk_bytes=16 << 20):
 
 
 __all__ = ["init", "init_peer", "shutdown", "empty", "copy_", "allreduce_",
-           "copy_large", "allreduce_large", "verify", "readback"]
+           "allreduce_into", "copy_large", "allreduce_large", "verify",
+           "readback"]

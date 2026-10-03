@@ -5,7 +5,9 @@
 #   from barlink_sm86 import process_group as blpg
 #   blpg.init_process_group(init_method="tcp://127.0.0.1:29500",
 #                           rank=r, world_size=2)
-#   dist.all_reduce(tensor)   # SUM only; fp32/fp64/bf16 native, fp16 via fp32
+#   dist.all_reduce(tensor)   # SUM only; contiguous aligned CUDA tensors of
+#                             # fp16/bf16/fp32/fp64/fp8 take the zero-copy
+#                             # path, everything else stages through the pool
 #
 # Process model: SYMMETRIC SPMD, one process per GPU (world MUST be 2). The
 # backend is a thin routing layer over bl._C peer mode; both ranks execute
@@ -43,6 +45,7 @@ class _CompletedWork(_C10dWork):
     subsequently enqueued on the CURRENT stream, so there is nothing to block
     on. torch's functional-collective layer (DTensor redistribute) requires a
     real Work object -- returning None segfaults c10d_functional at wait time.
+    Stateless, so every collective returns the same singleton instance.
     """
     def __init__(self):
         super().__init__()
@@ -55,6 +58,9 @@ class _CompletedWork(_C10dWork):
 
     def wait(self, timeout=None):
         return True
+
+
+_COMPLETED_WORK = _CompletedWork()
 
 
 def _round16(n):
@@ -115,11 +121,20 @@ class BarlinkBackend(_C10D.Backend):
             raise RuntimeError(
                 "barlink allreduce: only ReduceOp.SUM is supported, got %s" % op)
         orig = tensors[0]
+
+        # zero-copy path: the payload kernel reads the user's tensor in place
+        # and the add kernel writes it back -- no staging copies at all.
+        if self._zero_copy_usable(orig):
+            self._allreduce_zerocopy(orig)
+            return _COMPLETED_WORK
+
         t = self._to_device(orig)
         dt = t.dtype
 
         if dt == torch.float16:
-            # the pool has no fp16 add: reduce in fp32 staging, cast back
+            # only reachable for non-contiguous / unaligned fp16 (the
+            # zero-copy path handles the common case natively): the pool has
+            # no fp16 add, so reduce in fp32 staging and cast back
             self._allreduce_cast(t, torch.float32)
         elif dt not in _SUPPORTED:
             raise RuntimeError(
@@ -129,7 +144,34 @@ class BarlinkBackend(_C10D.Backend):
             self._allreduce_native(t)
         if t is not orig:
             orig.copy_(t)   # non-contiguous / CPU input: result into the original
-        return _CompletedWork()
+        return _COMPLETED_WORK
+
+    # dtypes the zero-copy kernel adds natively (fp16 included; u8 keeps the
+    # mod-256 pool semantics and stays on the staging path)
+    _ZC_DTYPES = (torch.float16, torch.float32, torch.float64, torch.bfloat16,
+                  torch.float8_e4m3fn, torch.float8_e5m2)
+
+    def _zero_copy_usable(self, t):
+        return (t.is_cuda and t.dtype in self._ZC_DTYPES and
+                t.is_contiguous() and t.numel() > 0 and
+                t.data_ptr() % 16 == 0 and
+                (t.numel() * t.element_size()) % 16 == 0)
+
+    def _allreduce_zerocopy(self, t):
+        nbytes = t.numel() * t.element_size()
+        # chunk bound: the peer scratch zone is pool/2 - flag tail; leave a
+        # 1 MiB margin. Chunks stay 16-byte aligned because the step is a
+        # multiple of 16 bytes and the tensor pointer is 16-aligned.
+        chunk = min(_CHUNK, (max(self._pool_mb // 2 - 1, 1)) << 20)
+        if nbytes <= chunk:
+            bl.allreduce_into(t, t)   # common case: no slicing overhead
+            return
+        isz = t.element_size()
+        per16 = 16 // isz
+        step = max(per16, (chunk // 16) * per16)
+        flat = t.view(-1)
+        for i in range(0, flat.numel(), step):
+            bl.allreduce_into(flat[i:i + step], flat[i:i + step])
 
     def _allreduce_native(self, t):
         n = t.numel() * t.element_size()
@@ -197,12 +239,12 @@ class BarlinkBackend(_C10D.Backend):
             # ld.relaxed.sys (the proven inbound-write path)
             data = bl.readback(rbuf)
             t.copy_(data.view(t.dtype)[:t.numel()])
-        return _CompletedWork()
+        return _COMPLETED_WORK
 
     def barrier(self, opts):
         x, y = self._ar_pair(16, torch.uint8)   # garbage in, ignored out
         bl.allreduce_(x, y)
-        return _CompletedWork()
+        return _COMPLETED_WORK
 
     # -- v1: not implemented ----------------------------------------------
     def all_gather_single(self, out, inp, opts):

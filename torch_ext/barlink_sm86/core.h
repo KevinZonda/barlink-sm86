@@ -70,10 +70,27 @@ int  bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx, void *srcPtr, int srcIdx,
 #define BL_DTYPE_BF16    3
 #define BL_DTYPE_FP8E4M3 4
 #define BL_DTYPE_FP8E5M2 5
+#define BL_DTYPE_FP16    6
 int  bl_allreduce_(blCtx *ctx, void *aPtr, int aIdx, void *bPtr, int bIdx,
                    size_t bytes, int dtype,
                    void *streamA, void *streamB,
                    char *err, size_t errlen);
+
+// Zero-copy peer allreduce: in/out are ARBITRARY device pointers (e.g. torch
+// tensors), NOT pool tensors. After both ranks call it: out holds
+// in + peer_in elementwise (same dtype semantics as bl_allreduce_; u8 is
+// NOT supported here -- it keeps the mod-256 pool path). One payload per
+// rank (in -> the peer's scratch zone), then a local add kernel writes out
+// directly -- no staging copies in or out of the pool, no host sync; the
+// call is fully stream-ordered like the rest of the peer protocol.
+//
+// Requirements: peer mode; in/out 16-byte aligned (torch allocations are);
+// byte size a non-zero multiple of 16 and <= the peer scratch zone
+// (pool/2 - flag tail -- chunk larger tensors at the caller); in == out
+// (in-place) or fully disjoint ranges.
+int  bl_allreduce_into_peer(blCtx *ctx, const void *inPtr, void *outPtr,
+                            size_t bytes, int dtype, void *stream,
+                            char *err, size_t errlen);
 
 // Byte proof over all device pairs: writes a pattern through each BAR1 path
 // and verifies it on the owner card through its own VMM pointer with
