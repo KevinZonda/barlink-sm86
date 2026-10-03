@@ -178,3 +178,66 @@ raw bl 链路 ≤64 KiB 是 22-26 µs）：
 
 PG 层比 raw bl 多出的 ~70 µs 固定开销 = staging 填充/回拷（两次 D2D copy）+
 Python/trampoline 调度；带宽项（>256 KB 后每翻倍 +~90 µs ≈ 12 GB/s 链路速度）一致。
+
+## 8. FLUX.2 Klein 9B DiT 张量并行 demo（2026-10-03）
+
+真实模型 TP=2 验证：双进程各持一张卡，diffusers 官方 `_tp_plan` 走
+`parallelize_module`，rowwise allreduce 全部经 barlink PG（BAR1 P2P 链路）。
+代码在 `demos/flux2_tp/`（`worker.py` 单文件同时支持 `--tp 1/2`，`run.sh`
+编排 + 正确性比对，`results/` 存日志与数字）。
+
+模型：`/mnt/modelzoo/black-forest-labs/FLUX.2-klein-base-9B/transformer`
+（diffusers 格式，9B bf16 = 16.9 GiB）。只用 transformer 本体做 DiT step
+benchmark：固定 seed 随机输入 img 4096 token（64×64 latent, patch=1,
+128ch）+ text context 512×12288 bf16 + timestep 0.5，`torch.inference_mode()`
+forward，CUDA event 计时，10 步（先 3 步 warmup）。
+
+### 结果
+
+| 配置 | ms/step (mean, min–max) | 峰值显存 |
+|---|---|---|
+| TP=1（单卡全模型） | 1401.3 (1391.9–1410.3) | 17.7 GiB |
+| TP=2（barlink PG） | 927.1 (922.3–929.7) | 16.9 GiB（含切分前的全量副本） |
+
+**加速比 1.51×**（token 数 4096+512，batch 1，bf16，2026-10-03 实测）。
+每 step 有 56 次 rowwise allreduce（8 double block × 4 + 24 single block × 1），
+通信量 ~1.5 GB/step（最大消息 37.7 MB，double block img 侧 33.5 MB）。
+理想算力减半对应 700 ms，实际 927 ms —— 差额 ~230 ms 即通信暴露 +
+每 rank 显存减半收益未计入算力（kernel launch、访存模式变化）。
+
+正确性（同 seed 输入，TP1 vs TP2 输出）：
+
+- cosine = 0.9998，rel_L2 = 1.77%，max_abs_err = 0.057（max|ref| = 4.53），
+  `allclose(atol=2e-2, rtol=1e-2)` 覆盖 98.1% 元素，逐 token rel_L2 最大 3.0%、
+  无离群 token。
+- 1% 阈值直接卡不过，但这**不是 bug**：用 anchor 实验（`--compute-fp32`：
+  bf16 权重 + fp32 计算的真值参考）测得 bf16 噪声底 —— TP1-bf16 离 anchor
+  rel_L2 = 2.31%，TP2-bf16 离 anchor 2.42%，二者互相之间（1.77%）比各自离
+  真值更近。**TP=2 与 TP=1 等距于真值，即 TP 切分正确**。
+- 判据（bf16 合理带）：cosine > 0.999 且 rel_L2 < 3%。`results/correctness.json`。
+
+### 踩到的三个坑（都修了）
+
+1. `parallelize_module` 默认 `src_data_rank=0`：切分权重时经 mesh scatter/
+   broadcast（barlink v1 无 send/recv，直接撞 `NotImplementedError`）。
+   两个 rank 加载的是同一份完整 checkpoint，`src_data_rank=None` 即纯本地
+   切分（diffusers `_styles` 的 plan 照常传）。
+2. **后端 collective 返回 `None` 会让 DTensor 段错误**：RowwiseParallel 输出
+   Partial→Replicate 走 `torch.ops._c10d_functional.all_reduce`，C++ 侧对
+   返回的 Work 解引用 —— Python 后端返回 None = 空指针，wait 时 SIGSEGV
+   （栈看上去像在 dropout，实为 AsyncCollectiveTensor 延迟等待点）。
+   修复：`process_group.py` 的 allreduce/broadcast/barrier 返回
+   `_CompletedWork`（已完成语义，与 stream-ordered 约定一致）。
+3. DTensor 参数做 dtype cast 必须走 `Module.to(dtype)`，`p.data = p.data.to()`
+   对 DTensor 不生效（静默留 bf16，forward 才报 dtype mismatch）。
+   仅 anchor 实验用到。
+
+### 复现
+
+```bash
+bash demos/flux2_tp/run.sh    # TP=1 → TP=2 → 正确性比对，结果落 results/
+```
+
+注意：run.sh 会等 GPU0 空闲再跑（本机可能有其它实验在轮流用卡），每阶段
+失败自动重试 10 次。环境：diffusers 0.40.0（自带 Flux2 `_tp_plan`），
+torch 2.14.0+cu130，`BL_POOL_MB=192`。

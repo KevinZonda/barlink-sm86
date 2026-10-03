@@ -12,9 +12,9 @@
 # identical op sequences with identical sizes (the bl link itself has no
 # runtime control channel -- see core.cu).
 #
-# Sync semantics: collective methods return None; completion is guaranteed
-# for work subsequently enqueued on the CURRENT stream (the flag waits are
-# stream-ordered). They are NOT host-synchronous.
+# Sync semantics: collectives return a completed _CompletedWork; completion
+# is guaranteed for work subsequently enqueued on the CURRENT stream (the
+# flag waits are stream-ordered). They are NOT host-synchronous.
 
 import os
 
@@ -31,6 +31,30 @@ _NATIVE = (torch.float32, torch.float64, torch.bfloat16,
            torch.float8_e4m3fn, torch.float8_e5m2)
 
 _CHUNK = 32 << 20   # per-exchange chunk for large allreduces (staging pair)
+
+
+from torch._C._distributed_c10d import Work as _C10dWork
+
+
+class _CompletedWork(_C10dWork):
+    """Return handle for host-async collectives.
+
+    barlink collectives are stream-ordered: completion is guaranteed for work
+    subsequently enqueued on the CURRENT stream, so there is nothing to block
+    on. torch's functional-collective layer (DTensor redistribute) requires a
+    real Work object -- returning None segfaults c10d_functional at wait time.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def is_completed(self):
+        return True
+
+    def is_success(self):
+        return True
+
+    def wait(self, timeout=None):
+        return True
 
 
 def _round16(n):
@@ -105,7 +129,7 @@ class BarlinkBackend(_C10D.Backend):
             self._allreduce_native(t)
         if t is not orig:
             orig.copy_(t)   # non-contiguous / CPU input: result into the original
-        return None
+        return _CompletedWork()
 
     def _allreduce_native(self, t):
         n = t.numel() * t.element_size()
@@ -173,12 +197,12 @@ class BarlinkBackend(_C10D.Backend):
             # ld.relaxed.sys (the proven inbound-write path)
             data = bl.readback(rbuf)
             t.copy_(data.view(t.dtype)[:t.numel()])
-        return None
+        return _CompletedWork()
 
     def barrier(self, opts):
         x, y = self._ar_pair(16, torch.uint8)   # garbage in, ignored out
         bl.allreduce_(x, y)
-        return None
+        return _CompletedWork()
 
     # -- v1: not implemented ----------------------------------------------
     def all_gather_single(self, out, inp, opts):
@@ -194,6 +218,9 @@ class BarlinkBackend(_C10D.Backend):
 
     def recv(self, tensors, srcRank, tag):
         raise NotImplementedError("barlink: recv is not implemented in v1")
+
+    def scatter(self, output_tensors, input_tensors, opts):
+        raise NotImplementedError("barlink: SCATTER_PROBE_12345")
 
 
 _backend = None

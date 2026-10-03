@@ -1,0 +1,18 @@
+{
+  "tp": 2,
+  "dtype": "bfloat16",
+  "img_tokens": 4096,
+  "txt_tokens": 512,
+  "steps": 1,
+  "warmup": 0,
+  "seed": 1234,
+  "load_s": 0.026149988174438477,
+  "shard_ms": 114.47381973266602,
+  "mean_ms_per_step": 3635.389404296875,
+  "min_ms_per_step": 3635.389404296875,
+  "max_ms_per_step": 3635.389404296875,
+  "times_ms": [
+    3635.389404296875
+  ],
+  "peak_mem_gib": 18.534722328186035
+}
