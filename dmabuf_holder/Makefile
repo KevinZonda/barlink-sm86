@@ -2,7 +2,7 @@
 #
 # Build against the running kernel (only meaningful on the host that owns
 # the GPUs, not inside an unprivileged container):
-#   make -C /lib/modules/$(uname -r)/build M=$PWD modules CC=gcc-14
+#   make -C /lib/modules/$(uname -r)/build M=$PWD modules CC=gcc-15
 #
 # Clean:
 #   make -C /lib/modules/$(uname -r)/build M=$PWD clean
