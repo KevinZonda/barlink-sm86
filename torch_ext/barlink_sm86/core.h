@@ -161,6 +161,12 @@ uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen);
 int  bl_probe_bar_atomic(blCtx *ctx, unsigned long long *res, int iters,
                          void *stream, char *err, size_t errlen);
 
+// Move 'bytes' from a local pool buffer (peer-written, inbound PCIe
+// writes) into an arbitrary device tensor with ld.relaxed.sys reads --
+// k_move semantics with an explicit source (the PG all_gather staging path)
+int  bl_pool_move(blCtx *ctx, void *srcPoolPtr, void *outPtr, size_t bytes,
+                  void *stream, char *err, size_t errlen);
+
 // debug: host read of the local pool's flag-tail slots (+0/+8 of slots
 // 0..7), for watching the handshake while a wait spins
 int  bl_debug_flags(blCtx *ctx, unsigned long long *vals,

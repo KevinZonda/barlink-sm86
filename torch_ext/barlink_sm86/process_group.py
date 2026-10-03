@@ -261,10 +261,16 @@ class BarlinkBackend(_C10D.Backend):
             t.copy_(data.view(t.dtype)[:t.numel()])
         return _COMPLETED_WORK
 
-    def barrier(self, opts):
+    def barrier(self, opts=None):
         self._dbg("barrier")
-        x, y = self._ar_pair(16, torch.uint8)   # garbage in, ignored out
-        bl.allreduce_(x, y)
+        # zero-copy fused allreduce on a cached tensor -- NOT pool tensors:
+        # pool allreduce_ mirrors tensors into the ar scratch zone and
+        # breaks once the pool bump grows past it (e.g. after large
+        # all_gather staging allocations)
+        if getattr(self, "_bar_t", None) is None:
+            self._bar_t = torch.zeros(256, dtype=torch.bfloat16,
+                                      device=self._device)
+        bl.allreduce_into(self._bar_t, self._bar_t)
         return _COMPLETED_WORK
 
     # -- point-to-point ---------------------------------------------------
@@ -366,7 +372,7 @@ class BarlinkBackend(_C10D.Backend):
         self._dbg("all_gather_single", tuple(input.shape), input.dtype)
         # output: [world * n] contiguous; input: [n]. rank r's slice at
         # [r*n:(r+1)*n]. SPMD: both ranks copy locally, then exchange
-        # their slices through the p2p path (full duplex).
+        # their slices.
         n = input.numel()
         r = self.rank()
         o2 = output.view(-1)
@@ -374,8 +380,41 @@ class BarlinkBackend(_C10D.Backend):
         mine = o2[r * n:(r + 1) * n]
         theirs = o2[(1 - r) * n:(2 - r) * n]
         mine.copy_(i2)
-        self._send_impl(mine)
-        self._recv_impl(theirs)
+        nbytes = n * input.element_size()
+        if nbytes == 0:
+            return _COMPLETED_WORK
+        p2p_chunk = (max(self._pool_mb // 4 - 1, 1)) << 20
+        if nbytes <= p2p_chunk:
+            # fast path: single-chunk p2p zero-copy exchange (full duplex)
+            self._send_impl(mine)
+            self._recv_impl(theirs)
+            return _COMPLETED_WORK
+        # large gather (e.g. vllm profile_run's padded-batch logits
+        # gather, hundreds of MB with a 248k vocab): staged exchange
+        # through the pool -- bl.copy_ is the proven arm-path protocol at
+        # any chunk count, and the p2p multi-chunk full-duplex path has an
+        # unresolved flag-delivery pathology (BUILD_AND_TEST.md section 10)
+        es = input.element_size()
+        per16 = 16 // es if 16 % es == 0 else 1
+        STAGE = 16 << 20
+        # ONE reusable staging pair (pool tensors are never freed; a
+        # per-size cache exhausts the pool on multi-size chunk tails)
+        if getattr(self, "_agstage", None) is None:
+            self._agstage = (
+                bl.empty(STAGE, device=self._device.index, dtype=torch.uint8),
+                bl.empty(STAGE, device=self._device.index, dtype=torch.uint8))
+        sfull, rfull = self._agstage
+        step = max(per16, (STAGE // 16) * per16)   # elems per 16MB chunk
+        for off in range(0, n, step):
+            j = min(off + step, n)
+            nb = (j - off) * es
+            nb16 = _round16(nb)
+            sbuf, rbuf = sfull[:nb16], rfull[:nb16]
+            sbuf[:nb].copy_(i2[off:j].view(torch.uint8))
+            bl.copy_(rbuf, sbuf)
+            tmp = torch.empty(nb16, dtype=torch.uint8, device=self._device)
+            bl.pool_move(rbuf, tmp)
+            theirs[off:j].view(torch.uint8).copy_(tmp[:nb])
         return _COMPLETED_WORK
 
     def allgather(self, output_tensors, input_tensors, opts=None):

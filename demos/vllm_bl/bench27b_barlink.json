@@ -1,0 +1,10 @@
+{
+  "backend": "barlink",
+  "shim_off": null,
+  "prompts": 4,
+  "gen_tokens": 1024,
+  "wall_s": 16.566234747995622,
+  "tps": 61.81247673819759,
+  "enforce_eager": true,
+  "sample": "  This is a deep-dive into the mechanics of Peer-to-Peer (P2P) Direct Memory Access (DMA) over a GPU's Base Address Register (BAR) 1 aperture. This mechanism is"
+}

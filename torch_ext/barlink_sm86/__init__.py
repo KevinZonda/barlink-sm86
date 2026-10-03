@@ -70,6 +70,7 @@ send_into = _C.send_into
 recv_into = _C.recv_into
 verify = _C.verify
 readback = _C.readback
+pool_move = _C.pool_move
 
 
 def _chunk_elems(itemsize, chunk_bytes):
@@ -115,4 +116,4 @@ def allreduce_large(a, b, chunk_bytes=16 << 20):
 
 __all__ = ["init", "init_peer", "shutdown", "empty", "copy_", "allreduce_",
            "allreduce_into", "send_into", "recv_into", "copy_large",
-           "allreduce_large", "verify", "readback"]
+           "allreduce_large", "verify", "readback", "pool_move"]

@@ -516,3 +516,33 @@ PATH="$PWD/.venv-vllm/bin:$PATH" ENFORCE_EAGER=1 BL_SKIP_INIT=1 BL_POOL_MB=192 \
    埋点需要在 core 里硬编码）。`--enforce-eager` 跑通在先，捕获问题留作
    TODO（方向：piecewise 捕获下 c10d 扩展后端的交互，或给 vllm 的
    all_reduce op 注册为 splitting op 使其不进图）。
+
+### 27B INT8 decode TPS 实测（2026-10-04，干净卡）
+
+vLLM 0.30 原生支持 Qwen3_5 架构（`Qwen3_5ForConditionalGeneration` 在
+registry；GDN 层走 Triton prefill + CUDA decode kernel；compressed-tensors
+W8A16 直接加载）。`--enforce-eager`（graph 捕获仍受阻，见上）：
+
+| backend | tok/s（batch 4 × 256 tok） | wall |
+|---|---|---|
+| barlink PG | **62.7 / 61.8**（均值 ~62.2） | 16.3–16.6 s |
+| NCCL（SHM 中转） | **65.4 / 64.5**（均值 ~64.9） | 15.7–15.9 s |
+
+- 两 backend greedy 输出逐字一致（同一 int8 kernel + 等价加法语义）。
+- NCCL 快 ~4%：enforce-eager 下每 op 走 Python→c10d→PG 派发，barlink 的
+  6/2-kernel 协议比 NCCL 单 kernel 多一点固定开销；差距比在自定义 decode
+  路径上的 ~1-2% 略大但仍同量级。
+- 对照自定义 decode 路径（§9，batch 1 手写循环）：barlink 8.11 / NCCL 8.01
+  tok/s —— vLLM 快 ~7.7×（fused kernel + 批量 + 成熟 GEMM），通信后端
+  差异在两种 harness 下都只有几个百分点。
+- 复现：`demos/vllm_bl/bench_27b.py`（barlink 经 entry.py 跳板；NCCL 加
+  `BL_SHIM_OFF=1` 直跑 venv python）；结果 json 在同目录。
+
+为跑通 27B 补的三个 PG/core 修复（均有回归）：① 大 allgather（vllm
+profile_run 的 padded logits gather，>p2p 区 48MB）改走 **pool 暂存 +
+bl.copy_ 臂路径交换 + 新 `bl.pool_move`（k_move 语义显式源）**，绕开多
+chunk 全双工 p2p 的未解病理；暂存用一对 16MB 复用 buffer（per-size 缓存
+会耗尽 pool）。② PG `barrier` 改零拷贝 fused allreduce（pool allreduce_
+要求 tensor 落在 ar scratch 镜像区内，大暂存分配后 bump 越界）。③ 修复
+core.cu 提交态不一致（BL_CAPDBG 定义在使用之后、initWaitCap 孤儿调用、
+NO_SIDESTREAM 诊断块引用未声明变量 —— 历史多轮编辑漂移）。

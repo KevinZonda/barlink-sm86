@@ -394,6 +394,28 @@ at::Tensor bar_atomic_probe(int64_t iters)
 
 // host read of the local pool's flag-tail slots (+0/+8 of slots 0..7):
 // watch the handshake while a wait spins (debug only)
+void pool_move(at::Tensor src_pool, at::Tensor out)
+{
+    int idx = 0;
+    void *src = nullptr;
+    checkPoolPtr(src_pool, &idx, &src);
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous(),
+                "barlink_sm86 pool_move: out must be a contiguous CUDA tensor");
+    TORCH_CHECK(out.get_device() == g_devices[g_myRank],
+                "barlink_sm86 pool_move: out must live on this rank's device");
+    size_t bytes = (size_t)src_pool.numel() * src_pool.element_size();
+    TORCH_CHECK(bytes == (size_t)out.numel() * out.element_size(),
+                "barlink_sm86 pool_move: size mismatch");
+    TORCH_CHECK(bytes % 16 == 0,
+                "barlink_sm86 pool_move: byte size must be a multiple of 16");
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(
+        out.get_device()).stream();
+    c10::cuda::CUDAGuard guard(out.get_device());
+    char err[BL_ERRBUF] = {0};
+    blCheck(bl_pool_move(g_ctx, src, out.data_ptr(), bytes, (void *)s,
+                         err, sizeof(err)), err);
+}
+
 at::Tensor debug_flags()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -457,4 +479,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("bar_atomic_probe", &bar_atomic_probe, py::arg("iters"),
           py::call_guard<py::gil_scoped_release>());
     m.def("debug_flags", &debug_flags, py::call_guard<py::gil_scoped_release>());
+    m.def("pool_move", &pool_move, py::call_guard<py::gil_scoped_release>());
 }

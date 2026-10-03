@@ -2204,7 +2204,6 @@ extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
         delete ctx; return -1;
     }
 
-    initWaitCap();
     // caps were only needed for the cudaHostRegister above
     bl_drop_caps();
     *out = ctx;
@@ -2710,6 +2709,18 @@ extern "C" int bl_is_peer(const blCtx *ctx)
     return ctx && ctx->peerMode;
 }
 
+#define BL_CAPDBG(where) do { \
+    if (std::getenv("BL_CAPDBG")) { \
+        cudaError_t e_ = cudaGetLastError(); \
+        if (e_ != cudaSuccess) { \
+            std::string m_ = std::string("CAPDBG ") + (where) + ": " + \
+                             cudaGetErrorString(e_); \
+            setErr(err, errlen, m_.c_str()); \
+            return -1; \
+        } \
+    } \
+} while (0)
+
 extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
                                  size_t bytes, int dtype, void *stream,
                                  char *err, size_t errlen)
@@ -2828,18 +2839,6 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     cudaDeviceSynchronize();
     return 0;
 }
-
-#define BL_CAPDBG(where) do { \
-    if (std::getenv("BL_CAPDBG")) { \
-        cudaError_t e_ = cudaGetLastError(); \
-        if (e_ != cudaSuccess) { \
-            std::string m_ = std::string("CAPDBG ") + (where) + ": " + \
-                             cudaGetErrorString(e_); \
-            setErr(err, errlen, m_.c_str()); \
-            return -1; \
-        } \
-    } \
-} while (0)
 
 extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
                                       void *outPtr, size_t bytes, int dtype,
@@ -3132,6 +3131,7 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
         // side stream (the 6-kernel arm path's shape)
         cudaStream_t cs = (cudaStream_t)stream;
         const size_t n4d = bytes / 16;
+        uint8_t *peerScratch = (uint8_t *)bar + ctx->p2pScratchBase;
         if (seq > 1 && !std::getenv("BL_P2P_NO_RECEIPT")) {
             k_flag_wait<<<1, 32, 0, cs>>>(
                 (unsigned long long *)(uintptr_t)(
@@ -3359,6 +3359,44 @@ extern "C" int bl_debug_flags(blCtx *ctx, unsigned long long *vals,
         }
     }
     cudaGetLastError();
+    return 0;
+}
+
+// Move 'bytes' from a LOCAL pool buffer (written by the peer through the
+// BAR -- inbound PCIe writes) into an arbitrary device tensor, reading with
+// ld.relaxed.sys (k_move's exact semantics). Used by the PG all_gather
+// staging path: bl_copy_ exchanges pool buffers (proven arm protocol at
+// any chunk count), this lifts the result into the user's tensor.
+extern "C" int bl_pool_move(blCtx *ctx, void *srcPoolPtr, void *outPtr,
+                            size_t bytes, void *stream, char *err,
+                            size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode || !srcPoolPtr || !outPtr ||
+        bytes == 0 || bytes % 16 != 0) {
+        setErr(err, errlen,
+               "bl_pool_move: bad argument (size a non-zero multiple of 16)");
+        return -1;
+    }
+    Pool &myP = ctx->pools[ctx->myRank];
+    uintptr_t base = (uintptr_t)myP.dptr;
+    if ((uintptr_t)srcPoolPtr < base ||
+        (uintptr_t)srcPoolPtr + bytes > base + myP.usableSize) {
+        setErr(err, errlen, "bl_pool_move: src outside the user pool region");
+        return -1;
+    }
+    const int myOrd = ctx->devices[ctx->myRank];
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_pool_move: cudaSetDevice failed");
+        return -1;
+    }
+    const size_t n4 = bytes / 16;
+    k_move<<<gridBlocks(n4, myOrd), 256, 0, (cudaStream_t)stream>>>(
+        (uint4 *)outPtr, (const uint4 *)srcPoolPtr, n4);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_pool_move: kernel launch failed");
+        return -1;
+    }
     return 0;
 }
 
