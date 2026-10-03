@@ -1,0 +1,9 @@
+rank 0: PG p2p 10240 B: pingpong 67.0/68.5 us, exchange 31.7/39.8 us (event/sync)
+rank 0: PG p2p 65536 B: pingpong 67.3/67.3 us, exchange 30.1/41.4 us (event/sync)
+rank 0: PG p2p 262144 B: pingpong 130.7/99.4 us, exchange 51.0/58.0 us (event/sync)
+rank 0: PG p2p 1048576 B: pingpong 523.9/524.0 us, exchange 206.7/150.5 us (event/sync)
+SUMMARY size pp_event_us pp_sync_us ex_event_us ex_sync_us
+SUMMARY 10240 67.0 68.5 31.7 39.8
+SUMMARY 65536 67.3 67.3 30.1 41.4
+SUMMARY 262144 130.7 99.4 51.0 58.0
+SUMMARY 1048576 523.9 524.0 206.7 150.5
