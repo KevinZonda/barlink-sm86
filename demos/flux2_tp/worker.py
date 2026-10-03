@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--tp", type=int, required=True, choices=[1, 2])
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--port", type=int, default=29500)
+    ap.add_argument("--backend", default="barlink",
+                    choices=["barlink", "nccl", "gloo"],
+                    help="TP=2 process group backend (TP=1 is always local)")
     ap.add_argument("--img-tokens", type=int, default=4096)
     ap.add_argument("--txt-tokens", type=int, default=512)
     ap.add_argument("--steps", type=int, default=10)
@@ -72,16 +75,23 @@ def main():
     dev = torch.device("cuda:0")
     dist_rank = 0
     if a.tp == 2:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
-                                        "torch_ext"))
-        from barlink_sm86 import process_group as blpg
         import torch.distributed as dist
-        blpg.init_process_group(init_method="tcp://127.0.0.1:%d" % a.port,
-                                rank=a.rank, world_size=2)
+        if a.backend == "barlink":
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
+                                            "..", "torch_ext"))
+            from barlink_sm86 import process_group as blpg
+            blpg.init_process_group(init_method="tcp://127.0.0.1:%d" % a.port,
+                                    rank=a.rank, world_size=2)
+            # Card selection follows run_pg.sh: no CUDA_VISIBLE_DEVICES, the
+            # rank picks the card (LOCAL_RANK is read by the PG as well).
+            dev = torch.device("cuda", a.rank)
+        else:
+            # stock torch backends (nccl/gloo): CUDA_VISIBLE_DEVICES pins one
+            # card per process, torch sees cuda:0 on both ranks.
+            dist.init_process_group(a.backend,
+                                    init_method="tcp://127.0.0.1:%d" % a.port,
+                                    rank=a.rank, world_size=2)
         dist_rank = dist.get_rank()
-        # Card selection follows run_pg.sh: no CUDA_VISIBLE_DEVICES, the
-        # rank picks the card (LOCAL_RANK is read by the PG as well).
-        dev = torch.device("cuda", a.rank)
 
     from diffusers import Flux2Transformer2DModel
 
@@ -164,6 +174,7 @@ def main():
         with open(os.path.join(a.out, "stats_%s.json" % tag), "w") as f:
             json.dump({
                 "tp": a.tp,
+                "backend": a.backend if a.tp == 2 else None,
                 "dtype": a.dtype,
                 "img_tokens": a.img_tokens,
                 "txt_tokens": a.txt_tokens,

@@ -1,0 +1,2 @@
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 203.05it/s]
+[tp=2 rank=0] load=0.0s shard=116 ms | 10 steps: mean=1564.1 ms/step min=1542.6 max=1580.0 | peak_mem=16.9 GiB

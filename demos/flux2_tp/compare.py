@@ -34,10 +34,14 @@ def rel_stats(a, b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
+    ap.add_argument("--left-tag", default="tp1",
+                    help="reference output/stats tag (default: tp1)")
+    ap.add_argument("--right-tag", default="tp2",
+                    help="challenger output/stats tag (default: tp2)")
     a = ap.parse_args()
 
-    ref = torch.load(os.path.join(a.dir, "output_tp1.pt"))
-    out = torch.load(os.path.join(a.dir, "output_tp2.pt"))
+    ref = torch.load(os.path.join(a.dir, "output_%s.pt" % a.left_tag))
+    out = torch.load(os.path.join(a.dir, "output_%s.pt" % a.right_tag))
     if ref.shape != out.shape:
         print("FAIL: shape mismatch %s vs %s" % (ref.shape, out.shape))
         sys.exit(1)
@@ -54,8 +58,10 @@ def main():
         s["anchor_rel_l2_max"] = max(s["anchor_tp1_rel_l2"],
                                      s["anchor_tp2_rel_l2"])
 
-    s1 = json.load(open(os.path.join(a.dir, "stats_tp1.json")))
-    s2 = json.load(open(os.path.join(a.dir, "stats_tp2.json")))
+    s1 = json.load(open(os.path.join(a.dir, "stats_%s.json" % a.left_tag)))
+    s2 = json.load(open(os.path.join(a.dir, "stats_%s.json" % a.right_tag)))
+    s["left_tag"] = a.left_tag
+    s["right_tag"] = a.right_tag
     s["tp1_mean_ms"] = s1["mean_ms_per_step"]
     s["tp2_mean_ms"] = s2["mean_ms_per_step"]
     s["speedup"] = s1["mean_ms_per_step"] / s2["mean_ms_per_step"]
@@ -67,10 +73,13 @@ def main():
     if "anchor_rel_l2_max" in s:
         print("anchor (fp32 compute): TP1 %.4f / TP2 %.4f rel_L2 — bf16 noise "
               "floor" % (s["anchor_tp1_rel_l2"], s["anchor_tp2_rel_l2"]))
-    print("tp1: %.1f ms/step  tp2: %.1f ms/step  speedup=%.2fx"
-          % (s["tp1_mean_ms"], s["tp2_mean_ms"], s["speedup"]))
+    print("%s: %.1f ms/step  %s: %.1f ms/step  speedup=%.2fx"
+          % (a.left_tag, s["tp1_mean_ms"], a.right_tag, s["tp2_mean_ms"],
+             s["speedup"]))
 
-    with open(os.path.join(a.dir, "correctness.json"), "w") as f:
+    out_name = ("correctness.json" if a.right_tag == "tp2"
+                else "correctness_%s.json" % a.right_tag)
+    with open(os.path.join(a.dir, out_name), "w") as f:
         json.dump(s, f, indent=2)
 
     if s["passed"]:

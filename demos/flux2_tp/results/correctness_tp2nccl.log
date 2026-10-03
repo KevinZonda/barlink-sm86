@@ -1,0 +1,4 @@
+cosine=0.999800  rel_L2=0.01773  max_abs_err=0.05722  allclose(2e-2)=0.9806
+anchor (fp32 compute): TP1 0.0231 / TP2 0.0242 rel_L2 — bf16 noise floor
+tp1: 1393.3 ms/step  tp2nccl: 918.2 ms/step  speedup=1.52x
+CORRECTNESS PASSED

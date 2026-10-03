@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# FLUX.2 Klein 9B DiT TP benchmark: TP=1 baseline + TP=2 over the barlink PG.
-# Two-process launch template: torch_ext/tests/run_pg.sh (blrun, per-rank
-# LOCAL_RANK card selection, shared BL_SOCK_PATH).
+# FLUX.2 Klein 9B DiT TP benchmark.
+#
+#   bash demos/flux2_tp/run.sh            # TP=1 + TP=2-barlink + correctness
+#   bash demos/flux2_tp/run.sh nccl       # TP=2-nccl only, vs the saved TP=1 ref
+#   bash demos/flux2_tp/run.sh gloo       # same, gloo (usually: unsupported)
+#
+# Two-process launch templates:
+#   barlink: torch_ext/tests/run_pg.sh (blrun, LOCAL_RANK card selection)
+#   nccl/gloo: one card per process via CUDA_VISIBLE_DEVICES (stock torch:
+#              needs no caps, plain python is fine)
 #
 # GPU 0 may be shared with other local experiments; each phase waits for a
 # free card and retries on failure (e.g. a collision mid-run).
@@ -9,6 +16,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 OUT=demos/flux2_tp/results
+BACKEND="${1:-barlink}"
 mkdir -p "$OUT"
 
 export BL_POOL_MB=192
@@ -30,27 +38,48 @@ run_tp1() {
     return ${PIPESTATUS[0]}
 }
 
-run_tp2() {
+run_tp2() {  # run_tp2 <barlink|nccl|gloo> <tag>
+    local backend=$1 tag=$2
     local port=$(( (RANDOM % 20000) + 20000 ))
     local sock="/tmp/bl_flux2_$$_$RANDOM.sock"
     wait_gpu
-    BL_SOCK_PATH="$sock" LOCAL_RANK=0 BL_SKIP_INIT=1 \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True tools/blrun \
-        demos/flux2_tp/worker.py --tp 2 --rank 0 --port "$port" \
-        --out "$OUT" 2>&1 | tee "$OUT/tp2_rank0.log" &
-    local p0=$!
-    BL_SOCK_PATH="$sock" LOCAL_RANK=1 BL_SKIP_INIT=1 \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True tools/blrun \
-        demos/flux2_tp/worker.py --tp 2 --rank 1 --port "$port" \
-        --out "$OUT" 2>&1 | tee "$OUT/tp2_rank1.log" &
-    local p1=$!
+    if [ "$backend" = "barlink" ]; then
+        BL_SOCK_PATH="$sock" LOCAL_RANK=0 BL_SKIP_INIT=1 \
+            PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True tools/blrun \
+            demos/flux2_tp/worker.py --tp 2 --backend barlink --rank 0 \
+            --port "$port" --tag "$tag" \
+            --out "$OUT" 2>&1 | tee "$OUT/${tag}_rank0.log" &
+        local p0=$!
+        BL_SOCK_PATH="$sock" LOCAL_RANK=1 BL_SKIP_INIT=1 \
+            PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True tools/blrun \
+            demos/flux2_tp/worker.py --tp 2 --backend barlink --rank 1 \
+            --port "$port" --tag "$tag" \
+            --out "$OUT" 2>&1 | tee "$OUT/${tag}_rank1.log" &
+        local p1=$!
+    else
+        # stock torch backend: no caps needed. NCCL on this box has no P2P
+        # (dual 3080, driver unsupported) -- disable the probes so init does
+        # not burn time discovering that, and keep it on SHM/host staging.
+        NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+            CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            .venv/bin/python demos/flux2_tp/worker.py --tp 2 --backend "$backend" \
+            --rank 0 --port "$port" --tag "$tag" \
+            --out "$OUT" 2>&1 | tee "$OUT/${tag}_rank0.log" &
+        local p0=$!
+        NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+            CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            .venv/bin/python demos/flux2_tp/worker.py --tp 2 --backend "$backend" \
+            --rank 1 --port "$port" --tag "$tag" \
+            --out "$OUT" 2>&1 | tee "$OUT/${tag}_rank1.log" &
+        local p1=$!
+    fi
     wait "$p0"; local r0=$?
     wait "$p1"; local r1=$?
     rm -f "$sock"
     [ "$r0" -eq 0 ] && [ "$r1" -eq 0 ]
 }
 
-retry() {  # retry <phase-name> <fn>
+retry() {  # retry <phase-name> <fn...>
     local name=$1; shift
     for attempt in $(seq 1 10); do
         echo "=== $name (attempt $attempt) $(date +%T) ==="
@@ -65,8 +94,16 @@ retry() {  # retry <phase-name> <fn>
     return 1
 }
 
-retry TP1 run_tp1 || exit 1
-retry TP2 run_tp2 || exit 1
-
-echo "=== correctness ==="
-.venv/bin/python demos/flux2_tp/compare.py --dir "$OUT" | tee "$OUT/correctness.log"
+if [ "$BACKEND" = "barlink" ]; then
+    retry TP1 run_tp1 || exit 1
+    retry TP2 run_tp2 barlink tp2 || exit 1
+    echo "=== correctness ==="
+    .venv/bin/python demos/flux2_tp/compare.py --dir "$OUT" \
+        | tee "$OUT/correctness.log"
+else
+    tag="tp2${BACKEND}"
+    retry "TP2-${BACKEND}" run_tp2 "$BACKEND" "$tag" || exit 1
+    echo "=== correctness (${tag} vs tp1) ==="
+    .venv/bin/python demos/flux2_tp/compare.py --dir "$OUT" \
+        --right-tag "$tag" | tee "$OUT/correctness_${tag}.log"
+fi

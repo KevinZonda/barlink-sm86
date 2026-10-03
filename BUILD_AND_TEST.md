@@ -215,16 +215,24 @@ forward，CUDA event 计时，10 步（先 3 步 warmup）。
 
 ### 结果
 
-| 配置 | ms/step (mean, min–max) | 峰值显存 |
-|---|---|---|
-| TP=1（单卡全模型） | 1393.3 (1384.6–1401.7) | 17.7 GiB |
-| TP=2（barlink PG，零拷贝） | 896.4 (891.5–905.7) | 16.9 GiB（含切分前的全量副本） |
+| 配置 | ms/step (mean, min–max) | vs TP=1 | 峰值显存 |
+|---|---|---|---|
+| TP=1（单卡全模型） | 1393.3 (1384.6–1401.7) | 1.00× | 17.7 GiB |
+| TP=2 barlink PG（零拷贝） | 896.4 (891.5–905.7) | **1.55×** | 16.9 GiB |
+| TP=2 NCCL（SHM 中转，无 P2P） | 918.2 (916.0–922.1) | 1.52× | 16.9 GiB |
+| TP=2 gloo（host staging） | 1564.1 | 0.89×（比单卡慢） | 16.9 GiB |
 
-**加速比 1.55×**（token 数 4096+512，batch 1，bf16，2026-10-03 实测；
-零拷贝 PG 前 TP=2 为 927.1 ms/step = 1.51×，见 git 历史）。
-每 step 有 56 次 rowwise allreduce（8 double block × 4 + 24 single block × 1），
-通信量 ~1.5 GB/step（最大消息 37.7 MB，double block img 侧 33.5 MB），全部走
-零拷贝路径（bf16、连续、对齐、单块直达）。
+（token 数 4096+512，batch 1，bf16，2026-10-03 实测；零拷贝 PG 前 TP=2-barlink
+为 927.1 ms/step = 1.51×，见 git 历史。NCCL/gloo 对比：`bash run.sh nccl|gloo`，
+同 seed 同输入，DTensor tp plan 不变，只换 ProcessGroup 后端。）
+
+**结论**：此负载通信带宽主导（~1.5 GB/step，最大消息 37.7 MB），barlink 与
+NCCL-SHM 的 step 时间接近（896 vs 918 ms，barlink 快 2.4%），差距主要体现在
+小消息固定延迟上（PG 层 10KB：barlink 25 µs vs NCCL-SHM 49 µs，§7）——对
+LLM decode 类每 token 多次小 allreduce 的场景意义更大。gloo 在 CUDA tensor 上
+可用但走 host 中转，比单卡还慢 11%，不可用。三后端正确性数字完全一致
+（cosine 0.9998 / rel_L2 1.77%）：bf16 加法两侧都是"float 加一次舍入"，与
+§8 上面测得的 bf16 噪声底一致，即 NCCL/gloo 输出也在真值 2.4% 带内。
 
 正确性（同 seed 输入，TP1 vs TP2 输出）：
 
@@ -256,9 +264,14 @@ forward，CUDA event 计时，10 步（先 3 步 warmup）。
 ### 复现
 
 ```bash
-bash demos/flux2_tp/run.sh    # TP=1 → TP=2 → 正确性比对，结果落 results/
+bash demos/flux2_tp/run.sh           # TP=1 → TP=2-barlink → 正确性比对
+bash demos/flux2_tp/run.sh nccl      # TP=2-nccl vs 已存的 TP=1 参考（NCCL_P2P_DISABLE=1）
+bash demos/flux2_tp/run.sh gloo      # TP=2-gloo，同上（慢，仅对照）
 ```
 
 注意：run.sh 会等 GPU0 空闲再跑（本机可能有其它实验在轮流用卡），每阶段
 失败自动重试 10 次。环境：diffusers 0.40.0（自带 Flux2 `_tp_plan`），
-torch 2.14.0+cu130，`BL_POOL_MB=192`。
+torch 2.14.0+cu130，`BL_POOL_MB=192`。NCCL 分支每进程用
+`CUDA_VISIBLE_DEVICES` 固定一张卡（stock torch，无需 caps）；本机双 3080
+无 P2P，NCCL 走 SHM/主机内存中转，init 前设 `NCCL_P2P_DISABLE=1`
+`NCCL_IB_DISABLE=1` 跳过能力探测。
