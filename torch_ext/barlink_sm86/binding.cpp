@@ -322,6 +322,60 @@ void allreduce_into(at::Tensor out, at::Tensor in)
                                    (void *)s, err, sizeof(err)), err);
 }
 
+// Zero-copy peer p2p (see core.h bl_send_into_peer / bl_recv_into_peer):
+// stream MY tensor into the peer's scratch zone / stream the peer's tensor
+// into MINE. Pure byte move -- every dtype is supported (u8 has no mod-256
+// semantics here); the size must be a non-zero multiple of 16 and the
+// pointer 16-aligned. Non-blocking, stream-ordered; the caller's sync.
+static void p2pCheck(const at::Tensor &t, size_t *bytesOut)
+{
+    TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
+    TORCH_CHECK(g_peer,
+                "barlink_sm86 p2p: peer (cross-process) mode only");
+    TORCH_CHECK(t.is_cuda(),
+                "barlink_sm86 p2p: tensor must be a CUDA tensor");
+    TORCH_CHECK(t.is_contiguous(),
+                "barlink_sm86 p2p: tensor must be contiguous");
+    TORCH_CHECK(t.get_device() == g_devices[g_myRank],
+                "barlink_sm86 p2p: tensor must live on this rank's device "
+                "(cuda:", g_devices[g_myRank], ")");
+    size_t bytes = (size_t)t.numel() * t.element_size();
+    TORCH_CHECK(bytes > 0 && bytes % 16 == 0,
+                "barlink_sm86 p2p: byte size must be a non-zero multiple "
+                "of 16");
+    TORCH_CHECK((uintptr_t)t.data_ptr() % 16 == 0,
+                "barlink_sm86 p2p: data pointer must be 16-byte aligned "
+                "(fresh torch allocations are)");
+    *bytesOut = bytes;
+}
+
+void send_into(at::Tensor t, int64_t peer_rank)
+{
+    size_t bytes = 0;
+    p2pCheck(t, &bytes);
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(
+        t.get_device()).stream();
+    c10::cuda::CUDAGuard guard(t.get_device());
+    char err[BL_ERRBUF] = {0};
+    // dtype is a pure byte move; the enum is validated in core, pass U8
+    blCheck(bl_send_into_peer(g_ctx, t.data_ptr(), bytes, BL_DTYPE_U8,
+                              (int)peer_rank, (void *)s, err, sizeof(err)),
+            err);
+}
+
+void recv_into(at::Tensor t, int64_t peer_rank)
+{
+    size_t bytes = 0;
+    p2pCheck(t, &bytes);
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(
+        t.get_device()).stream();
+    c10::cuda::CUDAGuard guard(t.get_device());
+    char err[BL_ERRBUF] = {0};
+    blCheck(bl_recv_into_peer(g_ctx, t.data_ptr(), bytes, BL_DTYPE_U8,
+                              (int)peer_rank, (void *)s, err, sizeof(err)),
+            err);
+}
+
 int64_t verify()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -363,6 +417,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("copy_", &copy_, py::call_guard<py::gil_scoped_release>());
     m.def("allreduce_", &allreduce_, py::call_guard<py::gil_scoped_release>());
     m.def("allreduce_into", &allreduce_into, py::arg("out"), py::arg("in"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("send_into", &send_into, py::arg("t"), py::arg("peer_rank"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("recv_into", &recv_into, py::arg("t"), py::arg("peer_rank"),
           py::call_guard<py::gil_scoped_release>());
     m.def("verify", &verify, py::call_guard<py::gil_scoped_release>());
     m.def("readback", &readback, py::call_guard<py::gil_scoped_release>());

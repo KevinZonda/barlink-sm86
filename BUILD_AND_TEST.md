@@ -152,11 +152,33 @@ dist.all_reduce(tensor)        # SUM；连续对齐的 CUDA tensor 走零拷贝�
 bl.allreduce_into(out, in)     # out = in + peer_in；in==out（原地）或完全不重叠
                                # fp16 原生（float opmath 加一次舍入，与 torch 一致）
                                # u8 不支持（保持 mod-256 pool 语义，走 allreduce_）
+bl.send_into(t, peer_rank)     # 零拷贝 p2p：纯字节搬运，任意 dtype（u8 无 mod-256
+bl.recv_into(t, peer_rank)     # 语义）；t 需 16 字节对齐、字节数非零 16 倍数、
+                               # ≤ p2p scratch 区（pool/4 − flag tail，调用方分块）
 ```
 
+p2p 协议（与 allreduce 的 arm 握手不同，三个要点）：
+
+- **scratch 分区**：allreduce 固定偏移在 scratch 区**下半部**，p2p 用**上半部**，
+  两协议交错无竞争
+- **consumed-receipt**：发送方第 k 次 send 等接收方第 k−1 次 recv 在 move kernel
+  读完后回执的 consumed flag（第 1 次免等）；不能用"recv 起始 arm"——同 stream 上
+  send 的等待自旋会挡在 recv 的 arm 之前，双方互相等待死锁
+- **send 走独立 side-stream**（recv 留在调用方 stream）：双方连续多个 send 再 recv
+  时，第二个 send 的 consumed 等待不会在单 stream 上挡住本端 recv；collective
+  发起前 join send-stream，防止 add 覆写 pending payload 正在读的 tensor
+
+PG 层 `dist.send/recv/isend/irecv`（torch 2.14 的 Backend 只有 send/recv 一对，
+isend/irecv/P2POp 都走它们，isend 只是不 wait 返回的 Work）：tag 接受但不传输
+（链路无控制通道，按调用序配对）；对齐且 16 倍数的 CUDA tensor 走零拷贝（**任意
+dtype**），其余（非 16 倍数、CPU、非连续）经 pool staging buffer 兜底；dst/src 必须
+是 `1 - rank`，world≠2 照常 raise。
+
 ```bash
-bash torch_ext/tests/run_pg.sh    # 两进程全流程测试（allreduce/broadcast/barrier/复用/错误路径）
-bash bench/latency/run_pg_lat.sh  # PG 层延迟 bench（10KB/64KB/256KB/1MB）
+bash torch_ext/tests/run_pg.sh        # 两进程全流程测试（allreduce/broadcast/barrier/复用/错误路径）
+bash torch_ext/tests/run_pg_p2p.sh    # p2p 全流程测试（全双工/乒乓/staged 兜底/交错/混合流量）
+bash bench/latency/run_pg_lat.sh      # PG 层延迟 bench（10KB/64KB/256KB/1MB allreduce）
+bash bench/latency/run_pg_p2p_lat.sh  # PG 层 p2p 延迟 bench（ping-pong 往返 + 全双工交换）
 ```
 
 环境变量：`BL_POOL_MB`（默认 64，PG 测试用 192 跑 96 MiB 分块路径）、`BL_SOCK_PATH`
@@ -167,13 +189,15 @@ bash bench/latency/run_pg_lat.sh  # PG 层延迟 bench（10KB/64KB/256KB/1MB）
 
 - **world_size 必须是 2**（底层链路双卡专用）；creator 里直接报错
 - **allreduce 只支持 ReduceOp.SUM**；dtype 支持 fp32/fp64/bf16/fp16/fp8×2/u8，其余 raise
-- **同步语义**：collective 返回已完成的 Work（单例），完成性由 current stream 的后续
-  enqueue/sync 保证，不是 host 同步
-- **零拷贝路径条件**：CUDA + contiguous + 16 字节对齐指针 + 字节数非零 16 倍数 +
-  ≤ peer scratch zone（pool/2 − flag tail，PG 层自动分块）；不满足则回退 pool
-  staging（u8、非连续、非对齐、CPU tensor 都走这条）
-- send/recv/all_gather/reduce_scatter 未实现（vLLM/DiT v1 用不到），调用 raise
-  NotImplementedError
+- **同步语义**：collective 与 p2p 都返回已完成的 Work（单例），完成性由 current
+  stream 的后续 enqueue/sync 保证，不是 host 同步（isend 发出的 buffer 在下一个
+  bl 调用/barrier 前不要复用）
+- **allreduce 零拷贝路径条件**：CUDA + contiguous + 16 字节对齐指针 + 字节数非零
+  16 倍数 + ≤ allreduce scratch 区（pool/4 − flag tail，PG 层自动分块）；不满足
+  则回退 pool staging（u8、非连续、非对齐、CPU tensor 都走这条）
+- **send/recv 零拷贝路径条件**：同上但**任意 dtype**（纯字节搬运），scratch 区是
+  p2p 专用的上半区（pool/4 − flag tail）；tag 不传输，按调用序配对；all_gather /
+  reduce_scatter 未实现，调用 raise NotImplementedError
 - subgroup（new_group 小于 world）不支持：后端是单例复用同一条链路，SPMD 纪律要求
   两端调用序列完全一致
 - **torchrun 启动拿不到 CAP_SYS_ADMIN**（file cap 不跨 execve 传递），workaround：
@@ -188,6 +212,22 @@ back-to-back；raw bl 链路 ≤64 KiB 是 22-26 µs；`bench/latency/run_pg_lat
 | 64 KB | 96 µs | **23 µs** | 4.2× |
 | 256 KB | 117 µs | **43 µs** | 2.7× |
 | 1 MB | 205 µs | **129 µs** | 1.6× |
+
+实测 PG 层 p2p 延迟（双 3080，2026-10-03，同方法；`bench/latency/run_pg_p2p_lat.sh`，
+`trials/` 有留底）：
+
+| size | ping-pong 往返 | 全双工交换（单向） |
+|---|---|---|
+| 10 KB | **66 µs** | **29 µs** |
+| 64 KB | 66 µs | 29 µs |
+| 256 KB | 131 µs | 51 µs |
+| 1 MB | 524 µs | 256 µs |
+
+对比：allreduce 10KB 25 µs（双向 payload 同时在飞 + add，摊到单向 ~12 µs）；p2p
+全双工交换 29 µs = 单向一次完整投递（send 侧 3 kernel：consumed 等待 + payload +
+完成 flag；recv 侧 3 kernel：flag 等待 + move + consumed 回执）。ping-pong 往返
+≈ 2 次串行投递（~33 µs/单向），符合链路串行化的预期。1 MB 单向 256 µs ≈
+4.1 GB/s（payload + move 各一次 D2D 级拷贝开销，无 add）。
 
 零拷贝协议：单 payload（kernel 直读用户 `in`，st.global.wt 写 peer scratch 固定
 偏移）+ 本地 add kernel 直写 `out`（scratch 侧 ld.relaxed.sys 读），arm/完成

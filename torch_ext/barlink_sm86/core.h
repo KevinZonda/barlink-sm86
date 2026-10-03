@@ -92,6 +92,32 @@ int  bl_allreduce_into_peer(blCtx *ctx, const void *inPtr, void *outPtr,
                             size_t bytes, int dtype, void *stream,
                             char *err, size_t errlen);
 
+// Zero-copy peer point-to-point (peer mode only; arbitrary device pointers
+// like bl_allreduce_into_peer). Pure BYTE MOVE -- dtype is validated for API
+// symmetry but never interpreted, so u8 has no mod-256 semantics here and
+// any itemsize works. One direction per call; the k-th send on one rank
+// pairs with the k-th recv of the same byte size on the peer (SPMD
+// discipline). There is no control channel and tags are NOT transported
+// (v1): matching is by per-direction ordinals. p2p uses its own flag slots
+// (2 + writer rank) and counters, independent of the allreduce/copy
+// protocol, so mixed sequences are safe.
+//
+// Protocol (per direction): the SENDER waits the consumed-receipt of the
+// previous exchange (posted by the peer's recv, stream-ordered after its
+// move kernel finished READING the scratch -- the first send of a session
+// skips the wait), streams 'in' into the peer's scratch zone (st.global.wt
+// through the BAR) and raises the completion flag; the RECEIVER waits that
+// flag, copies the scratch zone into 'out' with ld.relaxed.sys reads
+// (inbound PCIe writes) and posts the consumed-receipt. The receipt is
+// posted after the move rather than an arm before it deliberately: an
+// arm-at-start would deadlock a full-duplex pair, since the sender's
+// arm-wait kernel would spin ahead of its own recv's arm-mark on the same
+// stream while the peer's send waits for exactly that mark.
+int  bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes, int dtype,
+                       int peerRank, void *stream, char *err, size_t errlen);
+int  bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes, int dtype,
+                       int peerRank, void *stream, char *err, size_t errlen);
+
 // Byte proof over all device pairs: writes a pattern through each BAR1 path
 // and verifies it on the owner card through its own VMM pointer with
 // ld.global.cv. Returns total bad_bytes (0 = verified, ~0 = run failed).

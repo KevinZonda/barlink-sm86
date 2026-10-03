@@ -649,6 +649,18 @@ __global__ void k_add_into_fp8(uint4 *__restrict__ out,
     }
 }
 
+// Zero-copy recv move: read MY scratch zone (written by the peer through
+// the BAR -- inbound PCIe writes) with ld.relaxed.sys and write the user's
+// 'out' with plain local stores. Pure copy, no dtype logic.
+__global__ void k_move(uint4 *__restrict__ out, const uint4 *__restrict__ scr,
+                       size_t n4)
+{
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride)
+        out[i] = ldcs128(&scr[i]);
+}
+
 // Dispatch for the zero-copy add. fp16 is native here -- the whole point of
 // the zero-copy path is that it needs no pool-resident add dtype.
 static int launchAddInto(int dtype, uint4 *out, const uint4 *in,
@@ -1035,6 +1047,31 @@ struct blCtx {
     bool     peerMode = false;
     int      myRank = -1;
     size_t   scratchBase = 0;   // peer mode: user tensors live below this
+    size_t   p2pScratchBase = 0; // peer mode: p2p payloads live in the TOP
+                                 // half of the scratch zone; allreduce keeps
+                                 // the bottom half at scratchBase (fixed
+                                 // offset) -- the partition is what makes
+                                 // mixed p2p/allreduce sequences race-free
+
+    // p2p protocol state (bl_send_into_peer / bl_recv_into_peer): DEDICATED
+    // flag slots -- slot index 2 + writer rank (completion at +0 is written
+    // by the SENDER, consumed-receipt at +8 by the RECEIVER after its move
+    // kernel) -- and SEPARATE send/recv ordinals (a full-duplex pair posting
+    // send-then-recv on both ranks cross-pairs a shared counter: my send#k
+    // pairs the peer's recv#k, not its k-th op of any kind).
+    //
+    // Sends run on their OWN stream (recv on the caller's stream): on one
+    // stream, a rank posting several sends before its recvs deadlocks with
+    // the peer doing the same -- the second send's consumed-receipt wait
+    // would spin ahead of the recv that posts the receipt. The send stream
+    // is joined to the caller's stream at enqueue time (payload sees all
+    // prior caller-stream work); collectives on the caller's stream join the
+    // send stream through evSend so an add cannot overtake a pending payload
+    // that reads a tensor the add writes.
+    uint64_t p2pSendSeq = 0;
+    uint64_t p2pRecvSeq = 0;
+    cudaStream_t sendStream = nullptr;   // lazily created (non-blocking)
+    cudaEvent_t  evSend = nullptr;       // recorded after each send
 };
 
 // Reserved pool tail for the flag slots (one 256-byte slot per writer
@@ -1046,6 +1083,10 @@ static size_t flagOff(const Pool &P, int writerIdx)
 {
     return P.size - BL_FLAG_REGION + (size_t)writerIdx * BL_FLAG_SLOT;
 }
+
+// defined with the p2p primitives below; used by the collectives to order
+// themselves after pending p2p payloads
+static void joinSendStream(blCtx *ctx, cudaStream_t cs);
 
 static const size_t kAllocAlign = 2ull << 20;
 
@@ -1538,6 +1579,13 @@ extern "C" int bl_init(blCtx **out, const int *devices, int ndev,
 extern "C" void bl_shutdown(blCtx *ctx)
 {
     if (!ctx) return;
+    // p2p side stream / event (user contract: streams are idle at shutdown,
+    // same as the pool teardown below)
+    if (ctx->evSend) { cudaEventDestroy(ctx->evSend); ctx->evSend = nullptr; }
+    if (ctx->sendStream) {
+        cudaStreamDestroy(ctx->sendStream);
+        ctx->sendStream = nullptr;
+    }
     for (int i = ctx->ndev - 1; i >= 0; --i) teardownPool(ctx, i);
     delete ctx;
 }
@@ -1722,6 +1770,8 @@ extern "C" int bl_copy_(blCtx *ctx, void *dstPtr, int dstIdx,
             return -1;
         }
         cudaStream_t s = (cudaStream_t)srcStream;
+        joinSendStream(ctx, s);   // a pending p2p payload may be READING a
+                                  // pool tensor this copy overwrites as dst
         // 1. arm the peer (ordered after the caller's local fills, fence
         //    covers them); 2. wait MY arm, written by the peer's step 1
         k_mark<<<1, 1, 0, s>>>(
@@ -2066,9 +2116,18 @@ extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
 
     // Peer-mode memory layout: user tensors below scratchBase, exchange
     // scratch in [scratchBase, size - flagTail). Both ranks compute the
-    // same value because poolBytes (hence size) is equal.
+    // same value because poolBytes (hence size) is equal. The scratch zone
+    // is split: allreduce keeps the bottom half (its fixed offset is
+    // scratchBase), p2p takes the top half -- disjoint, so the two
+    // protocols can be interleaved freely.
     ctx->scratchBase = (myP.size / 2) & ~(kAllocAlign - 1);
     myP.usableSize = ctx->scratchBase;
+    {
+        const size_t scratchAvail =
+            myP.size - BL_FLAG_REGION - ctx->scratchBase;
+        ctx->p2pScratchBase =
+            ctx->scratchBase + ((scratchAvail / 2) & ~(size_t)15);
+    }
 
     // zero my flag tail BEFORE the peer can reach it (phase 2 below hands
     // out my barOff, after which the peer may write into my pool)
@@ -2169,7 +2228,7 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
         return -1;
     }
     uintptr_t omax = oa > ob ? oa : ob;
-    if (ctx->scratchBase + omax + bytes > myP.size - BL_FLAG_REGION) {
+    if (ctx->scratchBase + omax + bytes > ctx->p2pScratchBase) {
         setErr(err, errlen,
                "bl_allreduce_peer: tensor does not fit in the scratch zone");
         return -1;
@@ -2199,6 +2258,7 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
     const size_t n4 = bytes / 16;
     uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
     cudaStream_t s = (cudaStream_t)stream;
+    joinSendStream(ctx, s);
 
     // arm handshake (see the flag-slot protocol note): announce readiness
     // into the peer's arm slot, then wait MY arm slot (written by the
@@ -2284,12 +2344,13 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
                "(fresh torch allocations are)");
         return -1;
     }
-    const size_t scratchAvail =
-        myP.size - BL_FLAG_REGION - ctx->scratchBase;
+    // allreduce keeps the BOTTOM half of the scratch zone (fixed offset
+    // scratchBase); the p2p protocol owns the top half
+    const size_t scratchAvail = ctx->p2pScratchBase - ctx->scratchBase;
     if (bytes > scratchAvail) {
         setErr(err, errlen,
                "bl_allreduce_into_peer: size exceeds the peer scratch zone "
-               "(pool/2 - flag tail); chunk larger tensors at the caller");
+               "(pool/4 - flag tail); chunk larger tensors at the caller");
         return -1;
     }
     void *bar = pathDevPtr(ctx, peer, me);
@@ -2317,6 +2378,7 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     const size_t n4 = bytes / 16;
     uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
     cudaStream_t s = (cudaStream_t)stream;
+    joinSendStream(ctx, s);
 
     // arm handshake (same protocol as bl_allreduce_peer)
     k_mark<<<1, 1, 0, s>>>(
@@ -2358,6 +2420,201 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     }
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "bl_allreduce_into_peer: add kernel launch failed");
+        return -1;
+    }
+    return 0;
+}
+
+// p2p flag slots: dedicated to send/recv (slots 2 and 3 of the 16-slot
+// flag region; the allreduce/copy protocols use slots 0/1). In a given
+// pool, the slot of writer w carries: +0 completion (w was the SENDER,
+// raised after its payload) and +8 consumed-receipt (w was the RECEIVER,
+// raised after its move kernel finished reading the scratch).
+#define BL_P2P_SLOT(writerRank) (2 + (writerRank))
+
+// Lazily create the p2p send stream + event (non-blocking stream, no timing
+// event). The send stream is needed because several sends posted before the
+// matching recvs would deadlock on a single stream: the second send's
+// consumed-receipt wait would spin ahead of the recv that posts the receipt,
+// and the peer is in the same state.
+static int ensureSendStream(blCtx *ctx, char *err, size_t errlen)
+{
+    if (ctx->sendStream && ctx->evSend) return 0;
+    if (cudaStreamCreateWithFlags(&ctx->sendStream, cudaStreamNonBlocking)
+            != cudaSuccess) {
+        setErr(err, errlen, "bl p2p: send-stream creation failed");
+        return -1;
+    }
+    if (cudaEventCreateWithFlags(&ctx->evSend, cudaEventDisableTiming)
+            != cudaSuccess) {
+        setErr(err, errlen, "bl p2p: send-event creation failed");
+        return -1;
+    }
+    return 0;
+}
+
+// Order a caller-stream protocol op (allreduce / copy / readback) after all
+// pending p2p sends: a payload reads the user's 'in' tensor on the send
+// stream, and the collective's add (or a pool copy) must not overwrite that
+// tensor early.
+static void joinSendStream(blCtx *ctx, cudaStream_t cs)
+{
+    if (ctx->sendStream && ctx->evSend)
+        cudaStreamWaitEvent(cs, ctx->evSend, 0);
+}
+
+// Shared prologue for the zero-copy p2p pair: peer-mode/context checks,
+// alignment + p2p-scratch-zone bounds, BAR write path, next ordinal of the
+// direction's own counter. Returns 0 on success with the launch parameters
+// filled; -1 with err set otherwise.
+static int p2pPrelude(blCtx *ctx, const void *ptr, size_t bytes, int dtype,
+                      int peerRank, int isSend, void **barOut, uint64_t *seqOut,
+                      char *err, size_t errlen)
+{
+    if (!ctx || !ctx->peerMode || !ptr || bytes == 0 || bytes % 16 != 0) {
+        setErr(err, errlen,
+               "bl p2p: bad argument (non-null pointer, size a non-zero "
+               "multiple of 16)");
+        return -1;
+    }
+    if (dtype < BL_DTYPE_U8 || dtype > BL_DTYPE_FP16) {
+        setErr(err, errlen, "bl p2p: unsupported dtype enum");
+        return -1;
+    }
+    const int me = ctx->myRank;
+    if (peerRank != 1 - me) {
+        setErr(err, errlen,
+               "bl p2p: peerRank must be 1 - myRank in the 2-rank peer link");
+        return -1;
+    }
+    Pool &myP = ctx->pools[me];
+    if ((uintptr_t)ptr % 16 != 0) {
+        setErr(err, errlen,
+               "bl p2p: pointer must be 16-byte aligned (fresh torch "
+               "allocations are)");
+        return -1;
+    }
+    const size_t p2pZone = myP.size - BL_FLAG_REGION - ctx->p2pScratchBase;
+    if (bytes > p2pZone) {
+        setErr(err, errlen,
+               "bl p2p: size exceeds the p2p scratch zone (pool/4 - flag "
+               "tail); chunk larger tensors at the caller");
+        return -1;
+    }
+    void *bar = pathDevPtr(ctx, 1 - me, me);
+    if (!bar) {
+        setErr(err, errlen, "bl p2p: no BAR1 write path");
+        return -1;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->seqMu);
+        *seqOut = isSend ? ++ctx->p2pSendSeq : ++ctx->p2pRecvSeq;
+        ctx->lastIncoming[me] = *seqOut;
+    }
+    *barOut = bar;
+    return 0;
+}
+
+extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
+                                 int dtype, int peerRank, void *stream,
+                                 char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    void *bar = nullptr;
+    uint64_t seq = 0;
+    if (p2pPrelude(ctx, inPtr, bytes, dtype, peerRank, 1, &bar, &seq,
+                   err, errlen) != 0)
+        return -1;
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_send_into_peer: cudaSetDevice failed");
+        return -1;
+    }
+    if (ensureSendStream(ctx, err, errlen) != 0)
+        return -1;
+    const size_t n4 = bytes / 16;
+    uint8_t *peerScratch = (uint8_t *)bar + ctx->p2pScratchBase;
+    cudaStream_t ss = ctx->sendStream;
+
+    // join the caller's stream: the payload must see every local write to
+    // 'in' enqueued so far (user fills, prior collectives). Record on the
+    // caller's stream, wait on the send stream.
+    cudaEvent_t evCaller = nullptr;
+    if (cudaEventCreateWithFlags(&evCaller, cudaEventDisableTiming)
+            != cudaSuccess) {
+        setErr(err, errlen, "bl_send_into_peer: caller-event creation failed");
+        return -1;
+    }
+    cudaEventRecord(evCaller, (cudaStream_t)stream);
+    cudaStreamWaitEvent(ss, evCaller, 0);
+    cudaEventDestroy(evCaller);
+
+    // consumed-receipt wait for exchange k > 1 (on the send stream): the
+    // peer's recv k-1 posted it stream-ordered after its move kernel
+    // finished READING the scratch, so this payload cannot overwrite
+    // scratch the peer is still reading. (k == 1 skips the wait: nothing
+    // consumed the p2p zone before.)
+    if (seq > 1) {
+        k_flag_wait<<<1, 32, 0, ss>>>(
+            (unsigned long long *)(uintptr_t)(
+                myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8), seq - 1);
+    }
+    // payload: read MY 'in' (plain local loads), st.global.wt into the
+    // peer's p2p scratch zone; one completion mark covers it
+    k_copy<<<gridBlocks(n4, myOrd), 256, 0, ss>>>(
+        (const uint4 *)inPtr, (uint4 *)peerScratch, n4);
+    k_mark<<<1, 1, 0, ss>>>(
+        (unsigned long long *)((uint8_t *)bar +
+                               flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
+        seq);
+    if (cudaEventRecord(ctx->evSend, ss) != cudaSuccess ||
+        cudaGetLastError() != cudaSuccess) {
+        std::string es = cudaGetErrorString(cudaGetLastError());
+        setErr(err, errlen, "bl_send_into_peer: kernel launch failed: " + es);
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes,
+                                 int dtype, int peerRank, void *stream,
+                                 char *err, size_t errlen)
+{
+    setErr(err, errlen, "");
+    void *bar = nullptr;
+    uint64_t seq = 0;
+    if (p2pPrelude(ctx, outPtr, bytes, dtype, peerRank, 0, &bar, &seq,
+                   err, errlen) != 0)
+        return -1;
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_recv_into_peer: cudaSetDevice failed");
+        return -1;
+    }
+    const size_t n4 = bytes / 16;
+    cudaStream_t s = (cudaStream_t)stream;
+
+    // 1. wait the peer's completion flag for this ordinal, 2. move the p2p
+    //    scratch zone -> 'out', 3. post the consumed-receipt: stream-ordered
+    //    after the move kernel, so the peer's NEXT payload cannot overwrite
+    //    the zone while this move is reading it. All on the CALLER's
+    //    stream (recv is not prone to the multi-send deadlock).
+    k_flag_wait<<<1, 32, 0, s>>>(
+        (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_P2P_SLOT(peer))), seq);
+    k_move<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+        (uint4 *)outPtr,
+        (const uint4 *)(uintptr_t)(myP.dptr + ctx->p2pScratchBase), n4);
+    k_mark<<<1, 1, 0, s>>>(
+        (unsigned long long *)((uint8_t *)bar +
+                               flagOff(ctx->pools[peer], BL_P2P_SLOT(me)) + 8),
+        seq);
+    if (cudaGetLastError() != cudaSuccess) {
+        setErr(err, errlen, "bl_recv_into_peer: kernel launch failed");
         return -1;
     }
     return 0;
@@ -2545,6 +2802,7 @@ extern "C" int bl_readback(blCtx *ctx, int devIdx, void *ptr, size_t bytes,
         setErr(err, errlen, "bl_readback: cudaSetDevice failed");
         return -1;
     }
+    joinSendStream(ctx, (cudaStream_t)0);   // legacy default stream
     // wait for the most recent inbound copy to this pool (queued on the
     // legacy default stream, which is synchronizing with the users' blocking
     // streams; TODO: take an explicit stream argument for non-blocking

@@ -8,6 +8,8 @@
 #   dist.all_reduce(tensor)   # SUM only; contiguous aligned CUDA tensors of
 #                             # fp16/bf16/fp32/fp64/fp8 take the zero-copy
 #                             # path, everything else stages through the pool
+#   dist.send/recv (and isend/irecv / P2POp)  # zero-copy byte move, any
+#                             # dtype; tags accepted but not transported
 #
 # Process model: SYMMETRIC SPMD, one process per GPU (world MUST be 2). The
 # backend is a thin routing layer over bl._C peer mode; both ranks execute
@@ -159,10 +161,11 @@ class BarlinkBackend(_C10D.Backend):
 
     def _allreduce_zerocopy(self, t):
         nbytes = t.numel() * t.element_size()
-        # chunk bound: the peer scratch zone is pool/2 - flag tail; leave a
-        # 1 MiB margin. Chunks stay 16-byte aligned because the step is a
-        # multiple of 16 bytes and the tensor pointer is 16-aligned.
-        chunk = min(_CHUNK, (max(self._pool_mb // 2 - 1, 1)) << 20)
+        # chunk bound: the allreduce scratch zone is the BOTTOM quarter of
+        # the pool (pool/4 - flag tail; p2p owns the top), 1 MiB margin.
+        # Chunks stay 16-byte aligned because the step is a multiple of 16
+        # bytes and the tensor pointer is 16-aligned.
+        chunk = min(_CHUNK, (max(self._pool_mb // 4 - 1, 1)) << 20)
         if nbytes <= chunk:
             bl.allreduce_into(t, t)   # common case: no slicing overhead
             return
@@ -246,6 +249,90 @@ class BarlinkBackend(_C10D.Backend):
         bl.allreduce_(x, y)
         return _COMPLETED_WORK
 
+    # -- point-to-point ---------------------------------------------------
+    # torch 2.14's Backend exposes only send/recv (both return a Work;
+    # dist.isend/irecv and P2POp route through the SAME methods -- isend
+    # simply does not wait on the returned work). Tags are accepted but NOT
+    # transported: the bl link has no control channel, matching is by call
+    # order (SPMD discipline), same as every other op on this backend.
+    def send(self, tensors, dstRank, tag):
+        dst = int(dstRank)
+        if dst != 1 - self.rank():
+            raise RuntimeError(
+                "barlink send: world is 2, dst must be %d, got %d"
+                % (1 - self.rank(), dst))
+        self._send_impl(tensors[0])
+        return _COMPLETED_WORK
+
+    def recv(self, tensors, srcRank, tag):
+        src = int(srcRank)
+        if src != 1 - self.rank():
+            raise RuntimeError(
+                "barlink recv: world is 2, src must be %d, got %d"
+                % (1 - self.rank(), src))
+        self._recv_impl(tensors[0])
+        return _COMPLETED_WORK
+
+    # p2p zero-copy condition: like allreduce's but ANY dtype -- send/recv
+    # is a pure byte move (u8 has no mod-256 semantics here)
+    def _zc_p2p_usable(self, t):
+        return (t.is_cuda and t.is_contiguous() and t.numel() > 0 and
+                t.data_ptr() % 16 == 0 and
+                (t.numel() * t.element_size()) % 16 == 0)
+
+    def _p2p_zerocopy(self, t, send):
+        nbytes = t.numel() * t.element_size()
+        # chunk bound: the p2p scratch zone is the TOP quarter of the pool
+        # (pool/4 - flag tail; allreduce keeps the bottom half), 1 MiB margin
+        chunk = min(_CHUNK, (max(self._pool_mb // 4 - 1, 1)) << 20)
+        peer = 1 - self.rank()
+        if nbytes <= chunk:
+            if send:
+                bl.send_into(t, peer)
+            else:
+                bl.recv_into(t, peer)
+            return
+        step = (chunk // 16) * 16   # chunks stay 16-byte aligned
+        fb = t.view(torch.uint8).view(-1)
+        for off in range(0, nbytes, step):
+            c = fb[off:off + step]
+            # each chunk is its own exchange (own seq + arm handshake)
+            if send:
+                bl.send_into(c, peer)
+            else:
+                bl.recv_into(c, peer)
+
+    def _send_impl(self, t):
+        if self._zc_p2p_usable(t):
+            self._p2p_zerocopy(t, send=True)
+            return
+        # staged through the pool: any dtype / any size / CPU / strided.
+        # The round16 tail bytes are stale garbage on both sides; the
+        # receiver copies only the exact n bytes back.
+        t2 = self._to_device(t)
+        n = t2.numel() * t2.element_size()
+        n16 = _round16(max(n, 1))
+        sbuf = self._bcast_buf(n16, torch.uint8, "ps")
+        if n:
+            sbuf[:n].copy_(t2.view(torch.uint8).view(-1))
+        bl.send_into(sbuf, 1 - self.rank())
+
+    def _recv_impl(self, t):
+        if self._zc_p2p_usable(t):
+            self._p2p_zerocopy(t, send=False)
+            return
+        orig = t
+        t2 = orig if orig.is_cuda else orig.to(self._device)
+        t2 = t2.contiguous()
+        n = t2.numel() * t2.element_size()
+        n16 = _round16(max(n, 1))
+        rbuf = self._bcast_buf(n16, torch.uint8, "pr")
+        bl.recv_into(rbuf, 1 - self.rank())
+        if n:
+            t2.view(torch.uint8).view(-1).copy_(rbuf[:n])
+        if t2 is not orig:
+            orig.copy_(t2)
+
     # -- v1: not implemented ----------------------------------------------
     def all_gather_single(self, out, inp, opts):
         raise NotImplementedError(
@@ -254,12 +341,6 @@ class BarlinkBackend(_C10D.Backend):
     def reduce_scatter_single(self, out, inp, opts):
         raise NotImplementedError(
             "barlink: reduce_scatter_tensor is not implemented in v1")
-
-    def send(self, tensors, dstRank, tag):
-        raise NotImplementedError("barlink: send is not implemented in v1")
-
-    def recv(self, tensors, srcRank, tag):
-        raise NotImplementedError("barlink: recv is not implemented in v1")
 
     def scatter(self, output_tensors, input_tensors, opts):
         raise NotImplementedError("barlink: SCATTER_PROBE_12345")

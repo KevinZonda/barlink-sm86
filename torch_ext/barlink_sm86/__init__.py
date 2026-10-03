@@ -54,6 +54,8 @@ empty = _C.empty
 copy_ = _C.copy_
 allreduce_ = _C.allreduce_
 allreduce_into = _C.allreduce_into
+send_into = _C.send_into
+recv_into = _C.recv_into
 verify = _C.verify
 readback = _C.readback
 
@@ -100,5 +102,5 @@ def allreduce_large(a, b, chunk_bytes=16 << 20):
 
 
 __all__ = ["init", "init_peer", "shutdown", "empty", "copy_", "allreduce_",
-           "allreduce_into", "copy_large", "allreduce_large", "verify",
-           "readback"]
+           "allreduce_into", "send_into", "recv_into", "copy_large",
+           "allreduce_large", "verify", "readback"]
