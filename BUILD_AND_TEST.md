@@ -206,12 +206,12 @@ bash bench/latency/run_pg_p2p_lat.sh  # PG 层 p2p 延迟 bench（ping-pong 往�
 实测 PG 层 all_reduce 延迟（双 3080，2026-10-03，pool 192 MiB，50 次 event 计时
 back-to-back；raw bl 链路 ≤64 KiB 是 22-26 µs；`bench/latency/run_pg_lat.sh`）：
 
-| size | 零拷贝前 | 零拷贝后 | 提升 |
+| size | 零拷贝前 | 零拷贝后 | fused 小消息协议（≤64KB） |
 |---|---|---|---|
-| 10 KB | 92 µs | **25 µs** | 3.7× |
-| 64 KB | 96 µs | **23 µs** | 4.2× |
-| 256 KB | 117 µs | **43 µs** | 2.7× |
-| 1 MB | 205 µs | **129 µs** | 1.6× |
+| 10 KB | 92 µs | 25 µs | **16.4 µs** |
+| 64 KB | 96 µs | 23 µs | **19.4 µs** |
+| 256 KB | 117 µs | 43 µs | 43 µs（旧路径） |
+| 1 MB | 205 µs | 129 µs | 129 µs（旧路径） |
 
 实测 PG 层 p2p 延迟（双 3080，2026-10-03，同方法；`bench/latency/run_pg_p2p_lat.sh`，
 `trials/` 有留底）：
@@ -231,7 +231,25 @@ back-to-back；raw bl 链路 ≤64 KiB 是 22-26 µs；`bench/latency/run_pg_lat
 
 零拷贝协议：单 payload（kernel 直读用户 `in`，st.global.wt 写 peer scratch 固定
 偏移）+ 本地 add kernel 直写 `out`（scratch 侧 ld.relaxed.sys 读），arm/完成
-flag 协议不变，全程 stream-ordered、无 host sync、无 pool 中转。剩下 ~25 µs =
+flag 协议不变，全程 stream-ordered、无 host sync、无 pool 中转。
+
+**fused 小消息协议**（payload ≤ 64KB，2 个 kernel 替代 6 个；2026-10-04）：
+- consumed-receipt 门控（借 p2p 的教训，不用 arm 握手）：接收侧 fused kernel
+  完成 add 后由本地原子计数器选出的最后一个 block 向发送方 receipt slot
+  回执（BAR wt）；发送侧 fused kernel 每 block 先轮询本地 receipt ≥ seq−1
+  再写 peer scratch——等待链在 op 1 终止，无环
+- 专用 scratch 分区（allreduce 半区的顶部切片）+ 专用 flag/receipt slot，
+  fused 与旧 arm 路径**内存不相交**，混合尺寸序列无需跨协议门控（soak：
+  300 次验证 op + 50 对 fused/旧路径交错，逐位一致）
+- payload 与完成 flag 同 kernel：每 block `__threadfence_system` 后原子
+  加本地计数器，最后到达的 block 写 peer flag——与 6-kernel 版
+  "kernel 边界 + 单源 PCIe 保序"同一类论证，浸泡验证
+- >64KB 走原 6-kernel 路径不变；binding/PG 接口不变
+- BAR 原子探针结论：`atom.global.add.u64` 对 peer BAR1 窗口**功能可用**
+  （计数逐位正确），但比 posted-write+flag 慢（毫秒级 vs 微秒级），弃用
+  （`bl.bar_atomic_probe` 诊断保留）
+
+剩下 ~25 µs =
 c10d trampoline + 6 个 kernel launch（arm/armwait/payload/mark/flagwait/add）+
 flag 可见性（~3 µs×2）。大消息带宽不退化：32 MB/op 时 8.1 GB/s/方向 = 链路双向
 聚合 ~17 GB/s 的单方向份额（平台上限），raw bl 数字不变（`trials/` 有留底：
@@ -364,6 +382,7 @@ rel_l2 = 0.0）。结果（`QWEN38_TAG_SUFFIX=_fla`，与旧结果并存 results
 |---|---|---|---|---|
 | 原生 torch GDN | 8.03 | 8.03 | 8.95 / 8.93 | 12.8 ms/token |
 | fla 优化 GDN | 7.95（7.82–7.98） | 8.11（8.02–8.11） | 8.80 / 8.97 | 13.2 ms/token |
+| **fused 小消息协议**（≤64KB，10-04） | **8.11** | 8.01 | 8.83 / 8.99 | **10.0 ms/token** |
 
 fla 没带来端到端提速：GDN 原生路径只占每 token kernel 数的 ~13%（32.5k →
 28.7k，省 ~5ms device 时间，被 ±5% 运行噪声淹没）。瓶颈在量化 wrapper 与

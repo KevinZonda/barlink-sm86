@@ -376,6 +376,22 @@ void recv_into(at::Tensor t, int64_t peer_rank)
             err);
 }
 
+at::Tensor bar_atomic_probe(int64_t iters)
+{
+    TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
+    TORCH_CHECK(g_peer, "barlink_sm86 bar_atomic_probe: peer mode only");
+    static unsigned long long res[10];
+    char err[BL_ERRBUF] = {0};
+    cudaStream_t s = at::cuda::getCurrentCUDAStream().stream();
+    c10::cuda::CUDAGuard guard(g_devices[g_myRank]);
+    blCheck(bl_probe_bar_atomic(g_ctx, res, (int)iters, (void *)s,
+                                err, sizeof(err)), err);
+    auto out = at::empty({10}, at::TensorOptions().dtype(at::kLong));
+    for (int i = 0; i < 10; ++i)
+        out[i] = (int64_t)res[i];
+    return out;
+}
+
 int64_t verify()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -424,4 +440,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::call_guard<py::gil_scoped_release>());
     m.def("verify", &verify, py::call_guard<py::gil_scoped_release>());
     m.def("readback", &readback, py::call_guard<py::gil_scoped_release>());
+    m.def("bar_atomic_probe", &bar_atomic_probe, py::arg("iters"),
+          py::call_guard<py::gil_scoped_release>());
 }

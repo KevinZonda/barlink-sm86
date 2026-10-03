@@ -46,6 +46,15 @@ gemm 只占 21ms）。
   双卡必现，与 NCCL_P2P_DISABLE 无关）。
 - 每卡峰值显存 14.9 GiB（int8 shard 11.3 + embed 2.4 + lm_head 1.2 + 杂项）。
 
+## fused 小消息协议（2026-10-04）
+
+allreduce payload ≤64KB 走 2-kernel fused 路径（consumed-receipt 门控 + 本地
+原子 last-block 选举，专用 scratch 分区），>64KB 保持 6-kernel 旧路径。
+隔离口径 10KB allreduce 24.4→16.4 µs（`bench/latency/trials/fused-ar/`）；
+本 bench（tag `_fused`）：barlink **8.11** vs NCCL 8.01 tok/s，barlink 通信
+开销 12.8→**10.0 ms/token**，正确性仍逐位一致。BAR 原子（red/atom.global
+对 peer BAR1）功能可用但毫秒级延迟，弃用（见 BUILD_AND_TEST.md §7）。
+
 ## 复现
 
 ```bash

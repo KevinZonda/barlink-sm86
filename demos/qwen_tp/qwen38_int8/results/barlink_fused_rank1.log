@@ -1,0 +1,5 @@
+[rank1]:W1004 01:17:22.236000 115651 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[rank1]:W1004 01:17:22.255000 115651 .venv/lib/python3.14/site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+[qwen38-int8 barlink rank=1] load=15s peak=14.9 GiB
+[qwen38-int8 barlink rank=1] 64 tokens in 7.89s = 8.11 tok/s (prompt 42 tok, prefill 136.2 ms, decode 120.21 ms/token avg, all_reduce x 8192 = 3276.6 ms GPU-timeline)
+SAMPLE:   To understand how PCIe peer-to-peer (P2P) DMA over a GPU's BAR1 aperture works, we must look at the interaction between the PCIe protocol, the system's memory management (IOMMU), and the specific ar

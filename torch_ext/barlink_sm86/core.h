@@ -149,6 +149,18 @@ int  bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr, size_t bytes,
 // peer->me direction (the peer's process reports the other direction).
 uint64_t bl_verify_peer(blCtx *ctx, char *err, size_t errlen);
 
+// BAR atomic feasibility probe (diagnostic, used by the fused-protocol
+// design): measures the round-trip latency of atom.global.add.u64 issued
+// against the PEER's pool through the BAR1 write path (a sysmem VA from
+// cudaHostRegister IoMemory), against the marker-flag round trip used by
+// the protocols. res[] (6 entries): [0] atomic exchange us/iter, [1] flag
+// exchange us/iter, [2] final local slot value (must equal iters --
+// detects dropped/garbled atomic TLPs), [3] pre-armed launch baseline,
+// [4] empty-kernel launch baseline, [5] local-only mark baseline.
+// SPMD: BOTH ranks must call it with the same 'iters'.
+int  bl_probe_bar_atomic(blCtx *ctx, unsigned long long *res, int iters,
+                         void *stream, char *err, size_t errlen);
+
 // Drop all capabilities (prctl ambient clear + capset). Called by the
 // binding after a successful init; harmless without privileges.
 void bl_drop_caps(void);

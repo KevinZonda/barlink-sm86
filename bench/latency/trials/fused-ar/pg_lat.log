@@ -1,0 +1,9 @@
+rank 0: PG all_reduce 10240 B: 16.8 us (event), 26.9 us (sync)
+rank 0: PG all_reduce 65536 B: 19.4 us (event), 33.3 us (sync)
+rank 0: PG all_reduce 262144 B: 43.1 us (event), 57.4 us (sync)
+rank 0: PG all_reduce 1048576 B: 128.0 us (event), 143.1 us (sync)
+SUMMARY size event_us sync_us
+SUMMARY 10240 16.8 26.9
+SUMMARY 65536 19.4 33.3
+SUMMARY 262144 43.1 57.4
+SUMMARY 1048576 128.0 143.1

@@ -1079,6 +1079,15 @@ struct blCtx {
     uint64_t p2pRecvSeq = 0;
     cudaStream_t sendStream = nullptr;   // lazily created (non-blocking)
     cudaEvent_t  evSend = nullptr;       // recorded after each send
+
+    // fused small-message allreduce (<= BL_FUSED_MAX): per-direction ordinal
+    // and a dedicated scratch slice at the TOP of the allreduce half (so
+    // fused payloads never share memory with the arm-path payloads -- mixed
+    // fused/old sequences need no cross-protocol gating). Receipt (+0) and
+    // flag (+8) slots: BL_AR_RECV_SLOT / BL_AR_FLAG_SLOT of each pool, both
+    // written by the peer through the BAR.
+    uint64_t fusedSeq = 0;
+    size_t   fusedZoneBase = 0;  // == end of the shrunken old-path zone
 };
 
 // Reserved pool tail for the flag slots (one 256-byte slot per writer
@@ -2134,6 +2143,13 @@ extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
             myP.size - BL_FLAG_REGION - ctx->scratchBase;
         ctx->p2pScratchBase =
             ctx->scratchBase + ((scratchAvail / 2) & ~(size_t)15);
+        // fused small-message allreduce gets a dedicated slice at the TOP
+        // of the allreduce half (default 1 MiB, quarter of the ar zone at
+        // most); the arm-path bound becomes fusedZoneBase.
+        size_t arZone = ctx->p2pScratchBase - ctx->scratchBase;
+        size_t fz = arZone / 4 < (1u << 20) ? arZone / 4 : (1u << 20);
+        fz &= ~(size_t)15;
+        ctx->fusedZoneBase = ctx->p2pScratchBase - fz;
     }
 
     // zero my flag tail BEFORE the peer can reach it (phase 2 below hands
@@ -2192,6 +2208,490 @@ extern "C" int bl_init_peer(blCtx **out, int device, size_t poolBytes,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// BAR atomic feasibility probe (see core.h). Slot 6 of each pool's flag
+// region is dedicated to it.
+// ---------------------------------------------------------------------------
+
+__global__ void k_bar_atomic(unsigned long long *barSlot,
+                             unsigned long long *localOut)
+{
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(barSlot), "l"(1ULL) : "memory");
+        localOut[0] = old;
+    }
+}
+
+__global__ void k_empty() {}
+
+// forward decls (defined with the zero-copy add helpers below)
+__device__ __forceinline__ static float  blElemAdd(float a, float b);
+__device__ __forceinline__ static double blElemAdd(double a, double b);
+__device__ __forceinline__ static __nv_bfloat16 blElemAdd(__nv_bfloat16 a,
+                                                          __nv_bfloat16 b);
+__device__ __forceinline__ static __half blElemAdd(__half a, __half b);
+
+// ---------------------------------------------------------------------------
+// Fused small-message allreduce (2 stream-ordered kernels per op, replacing
+// the 6-kernel arm protocol for payloads <= BL_FUSED_MAX bytes). Design
+// notes (the send/recv deadlock lessons all apply):
+//   - consumed-receipt gating instead of the arm handshake: the RECEIVER's
+//     fused kernel posts the receipt to the sender's receipt slot (BAR wt,
+//     last block of a local atomic counter) AFTER its add consumed the
+//     scratch; the sender's fused kernel polls its LOCAL receipt slot
+//     (ld.relaxed.sys, proven to see inbound writes) before writing the
+//     peer's scratch. No circular arm: wait chains terminate at op 1.
+//   - dedicated scratch zone (top slice of the allreduce half) so fused
+//     traffic NEVER shares memory with the old arm-path payloads -- mixed
+//     fused/old sequences need no cross-protocol gating.
+//   - payload->flag ordering inside one kernel: every block fences
+//     (__threadfence_system) then bumps a LOCAL atomic counter; the last
+//     block stores the completion flag into the peer's flag slot. Same
+//     in-order-single-source-PCIe argument as the kernel-boundary case in
+//     the 6-kernel protocol (posted writes from one GPU port deliver in
+//     order); soak-tested by the PG regression loops.
+//   - every block polls the flag/receipt itself before touching payload --
+//     no grid-wide sync needed.
+// ---------------------------------------------------------------------------
+#define BL_FUSED_MAX   (64u << 10)     // payloads above this keep the 6-kernel path
+#define BL_AR_RECV_SLOT   4            // my pool: receipt from the peer (+0)
+#define BL_AR_FLAG_SLOT   5            // my pool: payload-complete flag from the peer (+0)
+#define BL_AR_CNT_SLOT    7            // local last-block election counters (+0 send, +8 recv)
+
+// fused producer: wait receipt >= seq-1, payload -> peer fused zone, then
+// (last block) raise the peer's flag.
+__global__ void k_fused_send(const uint4 *__restrict__ in,
+                             uint4 *__restrict__ peerScr,
+                             const unsigned long long *__restrict__ receipt,
+                             unsigned long long *__restrict__ flagBar,
+                             unsigned long long *__restrict__ counter,
+                             unsigned long long seq, size_t n4)
+{
+    // receipt gate: peer must have consumed the previous fused payload.
+    // seq == 1 (first fused op ever) finds the zero-initialized slot >= 0.
+    if (seq > 1) {
+        const long long t0 = clock64();
+        unsigned ns = 32;
+        for (;;) {
+            unsigned long long v;
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+                         : "=l"(v) : "l"(receipt) : "memory");
+            if (v >= seq - 1) break;
+            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            __nanosleep(ns);
+            if (ns < (1u << 20)) ns <<= 1;
+        }
+    }
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride)
+        stwt128(&peerScr[i], in[i]);
+    __threadfence_system();
+    __shared__ int isLast;
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
+        isLast = (old == (unsigned long long)gridDim.x - 1);
+        if (isLast) {
+            stwt64(flagBar, seq);
+            *counter = 0;   // next op's kernel starts after this one completes
+        }
+    }
+    __syncthreads();
+}
+
+// fused consumer: wait flag >= seq, out = in + scratch (ld.relaxed.sys),
+// then (last block) post the receipt to the peer.
+template <typename T>
+__global__ void k_fused_recv_t(uint4 *__restrict__ out,
+                               const uint4 *__restrict__ in,
+                               const uint4 *__restrict__ scr,
+                               const unsigned long long *__restrict__ flag,
+                               unsigned long long *__restrict__ receiptBar,
+                               unsigned long long *__restrict__ counter,
+                               unsigned long long seq, size_t n4)
+{
+    {
+        const long long t0 = clock64();
+        unsigned ns = 32;
+        for (;;) {
+            unsigned long long v;
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+                         : "=l"(v) : "l"(flag) : "memory");
+            if (v >= seq) break;
+            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            __nanosleep(ns);
+            if (ns < (1u << 20)) ns <<= 1;
+        }
+    }
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = in[i];
+        uint4 y = ldcs128(&scr[i]);
+        const T *xp = reinterpret_cast<const T *>(&x);
+        const T *yp = reinterpret_cast<const T *>(&y);
+        uint4 s;
+        T *sp = reinterpret_cast<T *>(&s);
+#pragma unroll
+        for (int k = 0; k < (int)(16 / sizeof(T)); ++k)
+            sp[k] = blElemAdd(xp[k], yp[k]);
+        out[i] = s;
+    }
+    __threadfence_system();
+    __shared__ int isLast;
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
+        isLast = (old == (unsigned long long)gridDim.x - 1);
+        if (isLast) {
+            stwt64(receiptBar, seq);
+            *counter = 0;
+        }
+    }
+    __syncthreads();
+}
+
+// fp8 variant on raw storage (same by-value miscompile workaround as the
+// other fp8 kernels).
+template <__nv_fp8_interpretation_t INTERP>
+__global__ void k_fused_recv_fp8(uint4 *__restrict__ out,
+                                 const uint4 *__restrict__ in,
+                                 const uint4 *__restrict__ scr,
+                                 const unsigned long long *__restrict__ flag,
+                                 unsigned long long *__restrict__ receiptBar,
+                                 unsigned long long *__restrict__ counter,
+                                 unsigned long long seq, size_t n4)
+{
+    {
+        const long long t0 = clock64();
+        unsigned ns = 32;
+        for (;;) {
+            unsigned long long v;
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+                         : "=l"(v) : "l"(flag) : "memory");
+            if (v >= seq) break;
+            if (clock64() - t0 > 4LL * 1000 * 1000 * 1000) __trap();
+            __nanosleep(ns);
+            if (ns < (1u << 20)) ns <<= 1;
+        }
+    }
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        uint4 x = in[i];
+        uint4 y = ldcs128(&scr[i]);
+        const __nv_fp8_storage_t *xp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&x);
+        const __nv_fp8_storage_t *yp =
+            reinterpret_cast<const __nv_fp8_storage_t *>(&y);
+        uint4 s;
+        __nv_fp8_storage_t *sp =
+            reinterpret_cast<__nv_fp8_storage_t *>(&s);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float fa = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(xp[k], INTERP)));
+            float fb = __half2float(
+                __half(__nv_cvt_fp8_to_halfraw(yp[k], INTERP)));
+            sp[k] = __nv_cvt_float_to_fp8(fa + fb, __NV_SATFINITE, INTERP);
+        }
+        out[i] = s;
+    }
+    __threadfence_system();
+    __shared__ int isLast;
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
+        isLast = (old == (unsigned long long)gridDim.x - 1);
+        if (isLast) {
+            stwt64(receiptBar, seq);
+            *counter = 0;
+        }
+    }
+    __syncthreads();
+}
+
+// local-atomic counters for the last-block election (own pool, flag tail
+// scratch area inside the fused zone metadata -- kept in unused flag slots)
+static int launchFusedRecv(int dtype, uint4 *out, const uint4 *in,
+                           const uint4 *scr,
+                           const unsigned long long *flag,
+                           unsigned long long *receiptBar,
+                           unsigned long long *counter,
+                           unsigned long long seq, size_t n4,
+                           size_t blocks, cudaStream_t stream)
+{
+    switch (dtype) {
+    case BL_DTYPE_FP16:    k_fused_recv_t<__half><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    case BL_DTYPE_FP32:    k_fused_recv_t<float><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    case BL_DTYPE_FP64:    k_fused_recv_t<double><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    case BL_DTYPE_BF16:    k_fused_recv_t<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    case BL_DTYPE_FP8E4M3: k_fused_recv_fp8<__NV_E4M3><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    case BL_DTYPE_FP8E5M2: k_fused_recv_fp8<__NV_E5M2><<<blocks, 256, 0, stream>>>(
+        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+    default: return -1;
+    }
+    return 0;
+}
+
+extern "C" int bl_probe_bar_atomic(blCtx *ctx, unsigned long long *res,
+                                   int iters, void *stream, char *err,
+                                   size_t errlen)
+{
+    setErr(err, errlen, "");
+    if (!ctx || !ctx->peerMode || iters <= 0) {
+        setErr(err, errlen, "bl_probe_bar_atomic: peer ctx and iters > 0");
+        return -1;
+    }
+    const int me = ctx->myRank, peer = 1 - me;
+    Pool &myP = ctx->pools[me];
+    const int myOrd = ctx->devices[me];
+    void *bar = pathDevPtr(ctx, peer, me);
+    if (!bar) {
+        setErr(err, errlen, "bl_probe_bar_atomic: no BAR1 write path");
+        return -1;
+    }
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_probe_bar_atomic: cudaSetDevice failed");
+        return -1;
+    }
+    // slot 6: probe counter at +0, probe flag at +8. each rank adds 1 to
+    // the PEER counter per iteration, so each rank's counter ends at iters
+    // iff the atomic TLPs terminate correctly on the peer BAR.
+    unsigned long long *mySlot = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, 6));
+    unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, 6) + 8);
+    unsigned long long *peerSlotBar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], 6));
+    unsigned long long *peerFlagBar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], 6) + 8);
+    unsigned long long *dout = nullptr;
+    if (cudaMalloc(&dout, 4 * sizeof(unsigned long long)) != cudaSuccess) {
+        setErr(err, errlen, "bl_probe_bar_atomic: cudaMalloc failed");
+        return -1;
+    }
+    cudaMemset(dout, 0, 4 * sizeof(unsigned long long));
+    cudaStream_t s = (cudaStream_t)stream;
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+
+    // phase 1: atomic exchange. per iter: atom.add on the peer counter,
+    // then wait MY counter reaching i+1 (i.e. the peer's atom landed).
+    // If the peer GPU's BAR does not terminate AtomicOp TLPs, the wait
+    // times out -> __trap -> CUDA error visible to the caller.
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        k_bar_atomic<<<1, 32, 0, s>>>(peerSlotBar, dout + 1);
+        k_flag_wait<<<1, 32, 0, s>>>(mySlot, (unsigned long long)(i + 1));
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: ATOMIC PHASE FAILED "
+               "(peer BAR probably does not terminate AtomicOp TLPs)");
+        return -1;
+    }
+    float ms1 = 0.f, ms2 = 0.f;
+    cudaEventElapsedTime(&ms1, e0, e1);
+
+    // phase 2: the protocols' own marker-flag exchange as the baseline.
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_mark<<<1, 1, 0, s>>>((unsigned long long *)peerFlagBar, v);
+        k_flag_wait<<<1, 32, 0, s>>>(myFlag, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: flag baseline failed");
+        return -1;
+    }
+    cudaEventElapsedTime(&ms2, e0, e1);
+
+    // phase 3: launch-overhead baseline -- pre-arm MY flag with the final
+    // value so every wait returns on the first poll (no peer dependency).
+    k_mark<<<1, 1, 0, s>>>(myFlag, (1ULL << 40) | 199ULL);
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_mark<<<1, 1, 0, s>>>((unsigned long long *)peerFlagBar, v);
+        k_flag_wait<<<1, 32, 0, s>>>(myFlag, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: pre-armed baseline failed");
+        return -1;
+    }
+    float ms3 = 0.f;
+    cudaEventElapsedTime(&ms3, e0, e1);
+
+    // phase 4: empty kernels, same stream/context (launch cost control)
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        k_empty<<<1, 32, 0, s>>>();
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: empty phase failed");
+        return -1;
+    }
+    float ms4 = 0.f;
+    cudaEventElapsedTime(&ms4, e0, e1);
+
+    // phase 5: k_mark to a LOCAL slot (no BAR traffic at all)
+    unsigned long long *localFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, 6) + 16);
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_mark<<<1, 1, 0, s>>>(localFlag, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: local-mark phase failed");
+        return -1;
+    }
+    float ms5 = 0.f;
+    cudaEventElapsedTime(&ms5, e0, e1);
+
+    // phase 6: k_mark to the PEER BAR slot only (no wait) -- isolates the
+    // BAR-store retire cost
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_mark<<<1, 1, 0, s>>>((unsigned long long *)peerFlagBar, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: bar-mark phase failed");
+        return -1;
+    }
+    float ms6 = 0.f;
+    cudaEventElapsedTime(&ms6, e0, e1);
+
+    // phase 7: pre-armed waits only (no mark in the loop)
+    k_mark<<<1, 1, 0, s>>>(myFlag, (1ULL << 40) | 199ULL);
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_flag_wait<<<1, 32, 0, s>>>(myFlag, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: wait-only phase failed");
+        return -1;
+    }
+    float ms7 = 0.f;
+    cudaEventElapsedTime(&ms7, e0, e1);
+
+    // phase 8: k_mark to PEER SLOT 2 (protocol-class slot, unused here)
+    unsigned long long *peerFlag2Bar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], 2) + 8);
+    cudaEventRecord(e0, s);
+    for (int i = 0; i < iters; ++i) {
+        unsigned long long v = (1ULL << 40) | (unsigned)i;
+        k_mark<<<1, 1, 0, s>>>((unsigned long long *)peerFlag2Bar, v);
+    }
+    cudaEventRecord(e1, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: slot2-mark phase failed");
+        return -1;
+    }
+    float ms8 = 0.f;
+    cudaEventElapsedTime(&ms8, e0, e1);
+
+    // phase 9: the exact protocol pattern -- 16KB payload (BAR stores) then
+    // k_mark, back to back, both directions running SPMD on the peer
+    {
+        uint8_t *peerScrBar = (uint8_t *)bar + ctx->scratchBase;
+        const uint4 *src = (const uint4 *)(uintptr_t)(myP.dptr + 512);
+        uint4 *dst = (uint4 *)peerScrBar;
+        cudaEventRecord(e0, s);
+        for (int i = 0; i < iters; ++i) {
+            k_copy<<<gridBlocks(1024, myOrd), 256, 0, s>>>(src, dst, 1024);
+            unsigned long long v = (1ULL << 40) | (unsigned)i;
+            k_mark<<<1, 1, 0, s>>>((unsigned long long *)peerFlag2Bar, v);
+        }
+        cudaEventRecord(e1, s);
+    }
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: protocol-pattern phase failed");
+        return -1;
+    }
+    float ms9 = 0.f;
+    cudaEventElapsedTime(&ms9, e0, e1);
+
+    res[0] = (unsigned long long)(ms1 * 1000.0 * 1000.0 / iters);
+    res[1] = (unsigned long long)(ms2 * 1000.0 * 1000.0 / iters);
+    res[3] = (unsigned long long)(ms3 * 1000.0 * 1000.0 / iters);
+    res[4] = (unsigned long long)(ms4 * 1000.0 * 1000.0 / iters);
+    res[5] = (unsigned long long)(ms5 * 1000.0 * 1000.0 / iters);
+    res[6] = (unsigned long long)(ms6 * 1000.0 * 1000.0 / iters);
+    res[7] = (unsigned long long)(ms7 * 1000.0 * 1000.0 / iters);
+    res[8] = (unsigned long long)(ms8 * 1000.0 * 1000.0 / iters);
+    res[9] = (unsigned long long)(ms9 * 1000.0 * 1000.0 / iters);
+    if (cudaMemcpy(&res[2], mySlot, 8, cudaMemcpyDeviceToHost)
+            != cudaSuccess) {
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(dout);
+        setErr(err, errlen, "bl_probe_bar_atomic: slot readback failed");
+        return -1;
+    }
+    cudaFree(dout);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    return 0;
+}
+
 // Drop all capabilities (ambient clear + capset). Exported so the binding
 // can share it between the single-process and peer init paths.
 extern "C" void bl_drop_caps(void)
@@ -2235,7 +2735,7 @@ extern "C" int bl_allreduce_peer(blCtx *ctx, void *aPtr, void *bPtr,
         return -1;
     }
     uintptr_t omax = oa > ob ? oa : ob;
-    if (ctx->scratchBase + omax + bytes > ctx->p2pScratchBase) {
+    if (ctx->scratchBase + omax + bytes > ctx->fusedZoneBase) {
         setErr(err, errlen,
                "bl_allreduce_peer: tensor does not fit in the scratch zone");
         return -1;
@@ -2352,8 +2852,9 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
         return -1;
     }
     // allreduce keeps the BOTTOM half of the scratch zone (fixed offset
-    // scratchBase); the p2p protocol owns the top half
-    const size_t scratchAvail = ctx->p2pScratchBase - ctx->scratchBase;
+    // scratchBase); the fused small-message path owns its top slice, the
+    // p2p protocol owns the top half
+    const size_t scratchAvail = ctx->fusedZoneBase - ctx->scratchBase;
     if (bytes > scratchAvail) {
         setErr(err, errlen,
                "bl_allreduce_into_peer: size exceeds the peer scratch zone "
@@ -2364,6 +2865,60 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     if (!bar) {
         setErr(err, errlen, "bl_allreduce_into_peer: no BAR1 write path");
         return -1;
+    }
+
+    if (cudaSetDevice(myOrd) != cudaSuccess) {
+        setErr(err, errlen, "bl_allreduce_into_peer: cudaSetDevice failed");
+        return -1;
+    }
+    const size_t n4 = bytes / 16;
+    uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
+    cudaStream_t s = (cudaStream_t)stream;
+    joinSendStream(ctx, s);
+
+    // fused small-message path: 2 stream-ordered kernels instead of 6
+    // (consumed-receipt gating + last-block flag/receipt election). Own
+    // scratch slice (top of the ar half) and own receipt/flag slots, so
+    // mixed fused/old sequences need no cross-protocol gating. See the
+    // kernel notes above bl_allreduce_into_peer.
+    if (bytes <= BL_FUSED_MAX) {
+        uint64_t fseq;
+        {
+            std::lock_guard<std::mutex> lk(ctx->seqMu);
+            fseq = ++ctx->fusedSeq;
+        }
+        const size_t fn4 = n4;
+        const size_t fblocks = gridBlocks(fn4, myOrd);
+        unsigned long long *myReceipt = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_RECV_SLOT));
+        unsigned long long *myFlagL = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT));
+        unsigned long long *sendCnt = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_CNT_SLOT));
+        unsigned long long *recvCnt = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_CNT_SLOT) + 8);
+        unsigned long long *peerFlagBar = (unsigned long long *)((uint8_t *)bar +
+            flagOff(ctx->pools[peer], BL_AR_FLAG_SLOT));
+        unsigned long long *peerReceiptBar = (unsigned long long *)((uint8_t *)bar +
+            flagOff(ctx->pools[peer], BL_AR_RECV_SLOT));
+        k_fused_send<<<fblocks, 256, 0, s>>>(
+            (const uint4 *)inPtr, (uint4 *)((uint8_t *)bar + ctx->fusedZoneBase),
+            myReceipt, peerFlagBar, sendCnt, fseq, fn4);
+        if (launchFusedRecv(dtype, (uint4 *)outPtr, (const uint4 *)inPtr,
+                            (const uint4 *)(uintptr_t)(
+                                myP.dptr + ctx->fusedZoneBase),
+                            myFlagL, peerReceiptBar, recvCnt,
+                            fseq, fn4, fblocks, s) != 0) {
+            setErr(err, errlen,
+                   "bl_allreduce_into_peer: fused path bad dtype (internal)");
+            return -1;
+        }
+        if (cudaGetLastError() != cudaSuccess) {
+            setErr(err, errlen,
+                   "bl_allreduce_into_peer: fused kernel launch failed");
+            return -1;
+        }
+        return 0;
     }
 
     // ONE seq per call per rank, one payload: my 'in' goes to the peer's
@@ -2377,15 +2932,6 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
         seq = ++ctx->dirSeq[me];
         ctx->lastIncoming[me] = seq;
     }
-
-    if (cudaSetDevice(myOrd) != cudaSuccess) {
-        setErr(err, errlen, "bl_allreduce_into_peer: cudaSetDevice failed");
-        return -1;
-    }
-    const size_t n4 = bytes / 16;
-    uint8_t *peerScratch = (uint8_t *)bar + ctx->scratchBase;
-    cudaStream_t s = (cudaStream_t)stream;
-    joinSendStream(ctx, s);
 
     // arm handshake (same protocol as bl_allreduce_peer)
     k_mark<<<1, 1, 0, s>>>(
