@@ -1,0 +1,18 @@
+{
+  "backend": "nccl",
+  "shim_off": "1",
+  "prompt_tokens": 16384,
+  "prompts": 1,
+  "gen_tokens": 1024,
+  "wall_s": 23.61285554501228,
+  "tps": 43.366207786601166,
+  "decode_tps": 92.85377578411101,
+  "prefill_s": 12.584763350023422,
+  "warm_wall_s": 11.028092194988858,
+  "spec": {
+    "mtp": 3,
+    "verify_ct": null
+  },
+  "enforce_eager": false,
+  "sample": " access between graphics processors over the peripheral component interconnect express bus, bypassing host memory entirely. The system uses peer to peer direct "
+}
