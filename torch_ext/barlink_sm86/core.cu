@@ -3067,6 +3067,104 @@ static void joinSendStream(blCtx *ctx, cudaStream_t cs)
     cudaStreamWaitEvent(cs, ctx->evSend, 0);
 }
 
+// --- replay-safe p2p protocol (device counters, 2 kernels per op) ----------
+// CUDA graphs replay these kernels without the host, so NO host-passed seq
+// may be baked in: waits compare counter VALUES read from memory and every
+// kernel execution advances a local device counter by exactly one (same
+// design as the fused allreduce above). Flag slots stay where they were
+// (slot[writer]+0 data flag, +8 receipt, remote red.add); MY OWN pool's
+// slot[me] -- which the p2p exchange never wrote -- now holds my local
+// state: +0 my flag expectation (bumped by my recv ops), +8 my receipt
+// expectation (bumped by my send ops), +16 send election, +24 recv election.
+// Chain per op k: K0 bumps this op's expectation to k (stream-ordered
+// before every read). K_send gates receipt >= receiptExp-1 (the peer
+// consumed my previous payload -- vacuous at op 1), copies the payload,
+// and the last block red.adds the peer's data flag. K_recv waits flag >=
+// flagExp, moves the scratch out, and the last block red.adds the peer's
+// receipt. Deadlock chain terminates at op 1; each replay advances every
+// counter exactly once. The side-stream send path keeps its event join --
+// events are only record/waited OUTSIDE graph capture (joinSendStream
+// skips the join while capturing; the noSide branch runs everything on the
+// caller stream, which is what a captured graph records).
+__global__ void k_p2p_bump(unsigned long long *exp)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        redadd64(exp, 1);
+}
+
+__global__ void k_p2p_send(const uint4 *__restrict__ in,
+                           uint4 *__restrict__ peerScr,
+                           const unsigned long long *__restrict__ receipt,
+                           const unsigned long long *__restrict__ receiptExp,
+                           unsigned long long *__restrict__ flagBar,
+                           unsigned long long *__restrict__ elect,
+                           size_t n4)
+{
+    if (receipt)
+        spin_until(receipt, ldseq(receiptExp) - 1);
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride)
+        stwt128(&peerScr[i], in[i]);
+    __threadfence_system();
+    __shared__ int isLast;
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(elect), "l"(1ULL) : "memory");
+        isLast = (old == (unsigned long long)gridDim.x - 1);
+        if (isLast) {
+            if (flagBar)
+                redadd64(flagBar, 1);
+            *elect = 0;   // next op's kernel starts after this one completes
+        }
+    }
+    __syncthreads();
+}
+
+__global__ void k_p2p_recv(uint4 *__restrict__ out,
+                           const uint4 *__restrict__ scr,
+                           const unsigned long long *__restrict__ flag,
+                           const unsigned long long *__restrict__ flagExp,
+                           unsigned long long *__restrict__ receiptBar,
+                           unsigned long long *__restrict__ elect,
+                           size_t n4)
+{
+    spin_until(flag, ldseq(flagExp));
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride)
+        out[i] = ldcs128(&scr[i]);
+    __threadfence_system();
+    __shared__ int isLast;
+    if (threadIdx.x == 0) {
+        unsigned long long old;
+        asm volatile("atom.global.add.u64 %0, [%1], %2;"
+                     : "=l"(old) : "l"(elect), "l"(1ULL) : "memory");
+        isLast = (old == (unsigned long long)gridDim.x - 1);
+        if (isLast) {
+            redadd64(receiptBar, 1);
+            *elect = 0;
+        }
+    }
+    __syncthreads();
+}
+
+// my pool's local p2p state pointers (see layout note above)
+static void p2pLocalSlots(blCtx *ctx, unsigned long long **flagExp,
+                          unsigned long long **receiptExp,
+                          unsigned long long **sendElect,
+                          unsigned long long **recvElect)
+{
+    Pool &myP = ctx->pools[ctx->myRank];
+    unsigned long long *base = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, BL_P2P_SLOT(ctx->myRank)));
+    if (flagExp)    *flagExp    = base + 0;
+    if (receiptExp) *receiptExp = base + 1;
+    if (sendElect)  *sendElect  = base + 2;
+    if (recvElect)  *recvElect  = base + 3;
+}
+
 // Shared prologue for the zero-copy p2p pair: peer-mode/context checks,
 // alignment + p2p-scratch-zone bounds, BAR write path, next ordinal of the
 // direction's own counter. Returns 0 on success with the launch parameters
@@ -3129,6 +3227,7 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     if (p2pPrelude(ctx, inPtr, bytes, dtype, peerRank, 1, &bar, &seq,
                    err, errlen) != 0)
         return -1;
+    (void)seq;   // flags are device counters now; host seq unused
     const int me = ctx->myRank, peer = 1 - me;
     Pool &myP = ctx->pools[me];
     const int myOrd = ctx->devices[me];
@@ -3138,25 +3237,40 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     }
     if (ensureSendStream(ctx, err, errlen) != 0)
         return -1;
-    const bool noSide = std::getenv("BL_P2P_NO_SIDESTREAM") != nullptr;
+    // CUDA graph capture: the side stream's event record/wait are capture-
+    // illegal (cross-stream ops with a non-captured stream), so run the
+    // send on the CALLER's stream while capturing (in-order wire delivery
+    // keeps it correct; the receipt protocol orders multi-chunk reuse)
+    cudaStreamCaptureStatus capSt = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        cudaStreamIsCapturing((cudaStream_t)stream, &capSt) == cudaSuccess &&
+        capSt != cudaStreamCaptureStatusNone;
+    const bool noSide = capturing ||
+        std::getenv("BL_P2P_NO_SIDESTREAM") != nullptr;
+
+    // replay-safe device-counter protocol args (see kernel notes above)
+    unsigned long long *receiptExp = nullptr, *sendElect = nullptr;
+    p2pLocalSlots(ctx, nullptr, &receiptExp, &sendElect, nullptr);
+    unsigned long long *myReceipt = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8);
+    unsigned long long *peerFlagBar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], BL_P2P_SLOT(me)));
+    if (std::getenv("BL_P2P_NO_RECEIPT"))
+        myReceipt = nullptr;
+    unsigned long long *flagOut = std::getenv("BL_P2P_NO_MARK")
+        ? nullptr : peerFlagBar;
+
     if (noSide) {
-        // diagnostic: run the send on the CALLER's stream instead of the
-        // side stream (the 6-kernel arm path's shape)
+        // diagnostic / graph-capture path: run the send on the CALLER's
+        // stream (a captured graph records these two kernels; the counter
+        // protocol makes replays advance the flags without host seqs)
         cudaStream_t cs = (cudaStream_t)stream;
         const size_t n4d = bytes / 16;
         uint8_t *peerScratch = (uint8_t *)bar + ctx->p2pScratchBase;
-        if (seq > 1 && !std::getenv("BL_P2P_NO_RECEIPT")) {
-            k_flag_wait<<<1, 32, 0, cs>>>(
-                (unsigned long long *)(uintptr_t)(
-                    myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8), seq - 1);
-        }
-        k_copy<<<gridBlocks(n4d, myOrd), 256, 0, cs>>>(
-            (const uint4 *)inPtr, (uint4 *)peerScratch, n4d);
-        if (!std::getenv("BL_P2P_NO_MARK"))
-            k_mark<<<1, 1, 0, cs>>>(
-                (unsigned long long *)((uint8_t *)bar +
-                                       flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
-                seq);
+        k_p2p_bump<<<1, 1, 0, cs>>>(receiptExp);
+        k_p2p_send<<<gridBlocks(n4d, myOrd), 256, 0, cs>>>(
+            (const uint4 *)inPtr, (uint4 *)peerScratch, myReceipt, receiptExp,
+            flagOut, sendElect, n4d);
         if (cudaGetLastError() != cudaSuccess) {
             setErr(err, errlen,
                    "bl_send_into_peer: caller-stream launch failed");
@@ -3175,25 +3289,14 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     cudaEventRecord(ctx->evCaller, (cudaStream_t)stream);
     cudaStreamWaitEvent(ss, ctx->evCaller, 0);
 
-    // consumed-receipt wait for exchange k > 1 (on the send stream): the
-    // peer's recv k-1 posted it stream-ordered after its move kernel
-    // finished READING the scratch, so this payload cannot overwrite
-    // scratch the peer is still reading. (k == 1 skips the wait: nothing
-    // consumed the p2p zone before.)
-    if (seq > 1 && !std::getenv("BL_P2P_NO_RECEIPT")) {
-        k_flag_wait<<<1, 32, 0, ss>>>(
-            (unsigned long long *)(uintptr_t)(
-                myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8), seq - 1);
-    }
-    // payload: read MY 'in' (plain local loads), st.global.wt into the
-    // peer's p2p scratch zone; one completion mark covers it
-    k_copy<<<gridBlocks(n4, myOrd), 256, 0, ss>>>(
-        (const uint4 *)inPtr, (uint4 *)peerScratch, n4);
-    if (!std::getenv("BL_P2P_NO_MARK"))
-        k_mark<<<1, 1, 0, ss>>>(
-            (unsigned long long *)((uint8_t *)bar +
-                                   flagOff(ctx->pools[peer], BL_P2P_SLOT(me))),
-            seq);
+    // bump the receipt expectation on the send stream (stream-ordered
+    // before the payload kernels) -- with the receipt gate inside k_p2p_send
+    // the payload cannot overwrite scratch the peer is still reading; the
+    // gate is vacuous at op 1 (receiptExp-1 == 0)
+    k_p2p_bump<<<1, 1, 0, ss>>>(receiptExp);
+    k_p2p_send<<<gridBlocks(n4, myOrd), 256, 0, ss>>>(
+        (const uint4 *)inPtr, (uint4 *)peerScratch, myReceipt, receiptExp,
+        flagOut, sendElect, n4);
     if (cudaEventRecord(ctx->evSend, ss) != cudaSuccess ||
         cudaGetLastError() != cudaSuccess) {
         std::string es = cudaGetErrorString(cudaGetLastError());
@@ -3213,6 +3316,7 @@ extern "C" int bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes,
     if (p2pPrelude(ctx, outPtr, bytes, dtype, peerRank, 0, &bar, &seq,
                    err, errlen) != 0)
         return -1;
+    (void)seq;   // flags are device counters now; host seq unused
     const int me = ctx->myRank, peer = 1 - me;
     Pool &myP = ctx->pools[me];
     const int myOrd = ctx->devices[me];
@@ -3223,21 +3327,23 @@ extern "C" int bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes,
     const size_t n4 = bytes / 16;
     cudaStream_t s = (cudaStream_t)stream;
 
-    // 1. wait the peer's completion flag for this ordinal, 2. move the p2p
-    //    scratch zone -> 'out', 3. post the consumed-receipt: stream-ordered
-    //    after the move kernel, so the peer's NEXT payload cannot overwrite
-    //    the zone while this move is reading it. All on the CALLER's
-    //    stream (recv is not prone to the multi-send deadlock).
-    k_flag_wait<<<1, 32, 0, s>>>(
-        (unsigned long long *)(uintptr_t)(
-            myP.dptr + flagOff(myP, BL_P2P_SLOT(peer))), seq);
-    k_move<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
+    // 1. bump my flag expectation (stream-ordered before the wait), 2. wait
+    //    the peer's data-flag count, 3. move the p2p scratch zone -> 'out',
+    //    4. the last block red.adds the peer's receipt -- the peer's NEXT
+    //    payload cannot overwrite the zone while this move is reading it.
+    //    All on the CALLER's stream (recv is not prone to the multi-send
+    //    deadlock); the counter protocol is CUDA-graph-replay-safe.
+    unsigned long long *flagExp = nullptr, *recvElect = nullptr;
+    p2pLocalSlots(ctx, &flagExp, nullptr, nullptr, &recvElect);
+    unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)));
+    unsigned long long *peerReceiptBar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], BL_P2P_SLOT(me)) + 8);
+    k_p2p_bump<<<1, 1, 0, s>>>(flagExp);
+    k_p2p_recv<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
         (uint4 *)outPtr,
-        (const uint4 *)(uintptr_t)(myP.dptr + ctx->p2pScratchBase), n4);
-    k_mark<<<1, 1, 0, s>>>(
-        (unsigned long long *)((uint8_t *)bar +
-                               flagOff(ctx->pools[peer], BL_P2P_SLOT(me)) + 8),
-        seq);
+        (const uint4 *)(uintptr_t)(myP.dptr + ctx->p2pScratchBase),
+        myFlag, flagExp, peerReceiptBar, recvElect, n4);
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "bl_recv_into_peer: kernel launch failed");
         return -1;

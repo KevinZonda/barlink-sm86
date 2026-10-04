@@ -412,19 +412,81 @@ HF glue 的 kernel 密度，不在 GDN。**对 fused 小消息协议优先级的
 切**——两 backend 通信开销无差，压 barlink 协议 kernel 数（6→3）收益有限；
 更大的富矿是真 W8A16 weight-only kernel（Marlin 类）和量化/反量化 fuse。
 
-**正确性**：两 backend 输出**逐位相同**（64 token 全 match，首 token logits
-rel_l2 = 0.0；两 rank 加法都在 fp32 域一次舍入，与 NCCL bf16 SUM 的 2-rank
-情形逐位一致）。`results/correctness_barlink_vs_nccl.json`。
+### CUDA graph 捕获 decode step（2026-10-04，`QWEN38_GRAPH=1`）
 
-两个平台坑（都写了备注）：
-- torch 2.14 的 NCCL lazy p2p communicator 在本平台**裸 isend/irecv 双卡
-  必现 illegal memory access**（与 NCCL_P2P_DISABLE 无关，最小复现 10 行）；
-  NCCL 分支的 lm_head 交换改用 all_gather（barlink 分支用 isend/irecv 零拷贝
-  p2p；barlink PG 未实现 all_gather）。
-- run.sh 的后台管道不能 `| tee`（`$!` 是 tee 的 pid，真实退出码丢失，曾把
-  崩溃的 phase 标成 OK）；日志直写文件。
+W8A16 路径上 decode step 整段捕获进一张 CUDA graph（`demos/qwen_tp/qwen38_int8/worker.py`
+`gen()` 的 graph 分支）。方案与结论：
 
-## 10. Qwen3.5-27B-GPTQ-Int4 TP=2 decode：barlink PG vs NCCL（2026-10-04）
+**捕获方案**：
+- **StaticCache**（transformers 5.18，`max_cache_len=n_prompt+n+8`）：全
+  in-place 更新、地址静态（HF 注释明写 "to preserve the static address for
+  cudagraphs"）。DynamicCache 的 `torch.cat` 每步新分配，graph 不安全。
+- **显式 `position_ids` 输入 tensor**（`spos`）+ 单 token `input_ids` 静态
+  buffer（`sid`）：每步只 `copy_`/`fill_` 输入值，graph 不烘焙数值。
+- eager i=1..3（兼作 triton/cublas/protocol warmup），**i==3 捕获
+  `[lm → lm_head → argmax]`**（捕获只录制不执行，cache 状态保持诚实）；
+  i≥4 `graph.replay()`。注意捕获后 graph 输出 tensor 尚未执行，i==4 的
+  输入必须是 eager 上一步的真实 token（曾因此踩过 replay 吃脏输入的
+  off-by-one，输出整流错位一格）。
+- **通信协议**：per-layer fused allreduce（b3cc1e9 设备计数器协议）与
+  lm_head isend/irecv p2p 全部录进 graph。捕获期间两个修复：(1) allreduce
+  计时 hook 的 cudaEventCreate 关闭（`_ar_events_off()`）；(2) **p2p 协议
+  从 host 序号改为设备计数器**（见下"踩坑"）。
+
+**性能**（干净卡双 3080，64 token 计时，2026-10-04）：
+
+| 模式 | barlink PG | NCCL |
+|---|---|---|
+| eager 基线 | 12.57–12.68 tok/s（decode ~66–67 ms/token） | 12.36–12.92 |
+| **CUDA graph** | **22.1–23.0 tok/s（decode 3.1 ms/token）** | **22.4** |
+
+per-token ~21×（3.09 vs 67 ms），tok/s +75~83%。graph 把 ~32.5k kernel/
+token 的 host 启动开销（eager decode 的绝对主体）压缩到一次
+`cudaGraphLaunch`。
+
+**正确性**（greedy 逐 token 对比，`results/genids_*_rank0.pt`）：
+- **graph vs 同 cache eager（StaticCache + 全 eager，
+  `QWEN38_GRAPH_NOCAP=1`）：多次运行 64/64 逐位一致**（gpw2、gfull1），
+  其余运行仅 1 个 near-tie token 漂移（如 token 60/63 单点翻转后整流
+  分叉）。
+- **eager 自身同样偶发单点 near-tie 漂移**（statice 三连跑：se1 逐位
+  一致、se2 在 53、se3 在 26 翻转）——该漂移是 barlink fused 协议已存在
+  的罕见竞态（~1/1–3k 次 op 交付略陈旧数据，幅度 ~near-tie 量级），
+  **与 graph 捕获无关**：NCCL backend graph 与 NCCL StaticCache eager
+  64/64 逐位一致，证明 harness 捕获链路本身逐位正确。
+- DynamicCache vs StaticCache（均 eager）：token 12 near-tie 翻转后分叉
+  （预分配零填充 KV + 不同 mask shape 的 ±ulp 差），两侧输出均连贯。
+- 旧 p2p 协议（host 序号）的 eager 流与以上全部不同（61/64 分叉）——
+  旧协议在 lm_head 交换上系统性交付陈旧数据，新协议修复后消失。
+
+**踩的坑（都修了）**：
+1. **p2p 协议的 host 序号不能进 graph**（本次主要 bug）：旧
+   `bl_send_into_peer/bl_recv_into_peer` 在 call 时取 host 序号烘焙进
+   kernel（`k_mark(flag, seq)` / `k_flag_wait(flag, seq)`）；graph replay
+   重放同一序号 → 接收端 flag 已 ≥ seq（上一步留下的）→ **不等待直接读
+   scratch**，跨卡竞争下偶读到上一步的 peer 半 logits。症状：graph 输出
+   流整体错位一格（graph[i]==eager[i-1]），触发位置不固定（首次 replay
+   或第 4 次 replay 都可能），`QWEN38_GRAPH_SYNC=1` 每步同步无效（序号
+   是烘焙的）。修复：照 fused allreduce 的设备计数器模式重写 p2p
+   （`k_p2p_bump/k_p2p_send/k_p2p_recv`：本地期望计数器 + 远端 red.add
+   累加 flag/receipt + last-block 选举；eager side-stream 路径保留 event
+   join，与 graph noSide 路径共用同一套计数器协议）。修复后 piecewise
+   （lm_head 交换留在 graph 外）与 full-graph 的漂移率相同，且与 eager
+   相同 → 残留罕见竞态定位到 fused allreduce（见下）。
+2. **残留罕见竞态（已知问题，未修）**：fused allreduce 协议（b3cc1e9）在
+   ~1/1–3k 次 op 交付略陈旧数据（eager paced 下也复现：三连跑 2/3 出现
+   单点 near-tie 翻转；`BL_AR_NO_FUSED=1` 走 6-kernel arm 路径三连跑逐位
+   一致 → 竞态在 fused 3-kernel 协议内部）。vLLM piecewise graph 下
+   allreduce 在 graph 外 eager 执行，从未暴露此 paced 场景。不影响输出
+   连贯性，后续单独排查。
+3. 捕获期 `dist.isend/irecv` 的 side-stream event record/wait 跨捕获流
+   非法 → core.cu 在 `cudaStreamIsCapturing` 时自动走 caller-stream
+   noSide 路径（修复 1 之后 noSide 就是常规路径之一，事件 join 仅在
+   非捕获的 side-stream 路径使用）。
+
+**回归**（新 p2p 协议后全绿）：`torch_ext/tests/run_pg.sh`、
+`run_pg_p2p.sh`、`test_w8a16.py`（ALL OK）、vLLM piecewise graph 冒烟
+（Qwen2-1.5B TP=2，输出连贯）。
 
 模型 `/mnt/modelzoo/Qwen/Qwen3.5-27B-GPTQ-Int4`（hf-mirror 被限速到 ~116 KB/s
 不可用时走 ModelScope）。混合架构：64 层 = 48 GatedDeltaNet 线性注意力 +

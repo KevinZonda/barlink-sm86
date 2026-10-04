@@ -154,12 +154,21 @@ def build_w8a16_linear(packed_i32, scale_bf16, dev):
 # TP helpers
 # ---------------------------------------------------------------------------
 
-_AR_TIME = {"events": [], "calls": 0}
+_AR_TIME = {"events": [], "calls": 0, "enabled": True}
+
+
+def _ar_events_off():
+    # CUDA graph capture: cudaEventCreate/Record inside the captured region
+    # is illegal -- the decode graph calls dist.all_reduce directly
+    _AR_TIME["enabled"] = False
 _NO_COMM = False
 
 
 def _timed_all_reduce(t):
     if _NO_COMM:
+        return t
+    if not _AR_TIME.get("enabled", True):
+        dist.all_reduce(t)      # graph capture: events are capture-illegal
         return t
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     e0.record()
@@ -495,30 +504,114 @@ def main():
     ids = tok(a.prompt, return_tensors="pt").input_ids.to(dev)
     n_prompt = ids.shape[1]
 
+    graph_mode = os.environ.get("QWEN38_GRAPH", "0") == "1"
+    if graph_mode:
+        _ar_events_off()    # cudaEventCreate inside capture is illegal
+
     def gen(n, dump_at=None):
-        cache = None
-        toks = []
         dumps = {}
         t_prefill = t_decode = 0.0
         with torch.inference_mode():
-            for i in range(n):
-                inp = ids if i == 0 else toks[-1][:, None]
-                torch.cuda.synchronize(dev)
-                t0 = time.perf_counter()
-                out = lm(input_ids=inp, past_key_values=cache, use_cache=True)
-                cache = out.past_key_values
-                h = out.last_hidden_state[:, -1]
-                logits = lm_head(h)                     # bf16, allgathered
-                if i == 0:
-                    t_prefill = time.perf_counter() - t0
+            if not graph_mode:
+                cache = None
+                toks = []
+                for i in range(n):
+                    inp = ids if i == 0 else toks[-1][:, None]
+                    torch.cuda.synchronize(dev)
+                    t0 = time.perf_counter()
+                    kwargs = {"input_ids": inp, "past_key_values": cache,
+                              "use_cache": True}
+                    out = lm(**kwargs)
+                    cache = out.past_key_values
+                    h = out.last_hidden_state[:, -1]
+                    logits = lm_head(h)                 # bf16, allgathered
+                    if i == 0:
+                        t_prefill = time.perf_counter() - t0
+                    else:
+                        t_decode += time.perf_counter() - t0
+                    nxt = logits.argmax(-1)
+                    toks.append(nxt)
+                    if dump_at is not None and i == dump_at:
+                        dumps = {"logits": logits.float().cpu(),
+                                 "hidden": h.float().cpu()}
+                return torch.stack(toks, dim=1), t_prefill, t_decode, dumps
+
+            # ---- CUDA-graph decode ----
+            # StaticCache preallocates and updates in-place (transformers
+            # keeps the addresses static "for cudagraphs"); position_ids is
+            # an explicit input tensor so per-step VALUES are not baked into
+            # the graph. The barlink fused allreduce protocol is replay-safe
+            # (device counters, no host seq, b3cc1e9); the lm_head p2p
+            # exchange runs on the caller stream during capture (cross-
+            # stream event ops are capture-illegal; core.cu auto-falls back).
+            from transformers import StaticCache
+            n_prompt = ids.shape[1]
+            cache = StaticCache(config=tc, max_cache_len=n_prompt + n + 8)
+            torch.cuda.synchronize(dev)
+            t0 = time.perf_counter()
+            out = lm(input_ids=ids, past_key_values=cache, use_cache=True)
+            cache = out.past_key_values
+            logits = lm_head(out.last_hidden_state[:, -1])
+            t_prefill = time.perf_counter() - t0
+
+            sid = torch.zeros(1, 1, dtype=torch.long, device=dev)
+            spos = torch.zeros(1, 1, dtype=torch.long, device=dev)
+            toks = []
+            graph = None
+            nocap = os.environ.get("QWEN38_GRAPH_NOCAP") == "1"
+            piecewise = os.environ.get("QWEN38_GRAPH_PIECEWISE") == "1"
+            nxt = logits.argmax(-1)
+            toks.append(nxt.clone())          # token 0 (from prefill)
+            for i in range(1, n):
+                pos = n_prompt + i - 1
+                sid.copy_(nxt.view(1, 1))
+                spos.fill_(pos)
+                if i < 4 or nocap:
+                    # eager: real tokens, warms triton/cublas and the
+                    # protocol counters; capture at i == 3 (records but
+                    # does NOT execute, so cache state stays honest)
+                    torch.cuda.synchronize(dev)
+                    t0 = time.perf_counter()
+                    out = lm(input_ids=sid, past_key_values=cache,
+                             use_cache=True, position_ids=spos)
+                    h = out.last_hidden_state[:, -1]
+                    logits = lm_head(h)
+                    if graph is None:
+                        t_decode += time.perf_counter() - t0
+                    nxt = logits.argmax(-1)
+                    toks.append(nxt.clone())
+                    if i == 3 and os.environ.get("QWEN38_GRAPH_NOCAP") != "1":
+                        gr = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(gr):
+                            out_g = lm(input_ids=sid, past_key_values=cache,
+                                       use_cache=True, position_ids=spos)
+                            h_g = out_g.last_hidden_state[:, -1]
+                            if piecewise:
+                                # bisect/diagnostic: keep only the local half
+                                # matmul in-graph; the p2p exchange + cat +
+                                # argmax run eager between replays
+                                half_g = F.linear(h_g, lm_head.weight)
+                            else:
+                                logits_g = lm_head(h_g)
+                                g_tok = logits_g.argmax(-1)  # static output
+                        # NOTE: g_tok is not executed yet — nxt must keep
+                        # pointing at the eager token so the i==4 replay is
+                        # fed the real previous token, not stale pool memory
+                        graph = gr
                 else:
-                    t_decode += time.perf_counter() - t0
-                nxt = logits.argmax(-1)
-                toks.append(nxt)
-                if dump_at is not None and i == dump_at:
-                    dumps = {"logits": logits.float().cpu(),
-                             "hidden": h.float().cpu()}
-        return torch.stack(toks, dim=1), t_prefill, t_decode, dumps
+                    if i == 4:
+                        torch.cuda.synchronize(dev)
+                        t0 = time.perf_counter()
+                    graph.replay()
+                    if os.environ.get("QWEN38_GRAPH_SYNC") == "1":
+                        torch.cuda.synchronize(dev)
+                    if piecewise:
+                        g_tok = lm_head(h_g).argmax(-1)
+                    if i == n - 1:
+                        t_decode += time.perf_counter() - t0
+                    toks.append(g_tok.clone())  # snapshot before next replay
+                    nxt = g_tok
+            return torch.stack(toks, dim=1), t_prefill, t_decode, dumps
 
     # warmup (PG lazy init, kernel compile, allocator)
     gen(a.warmup_tokens)

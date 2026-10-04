@@ -1,0 +1,18 @@
+{
+  "model": "Qwen3.8-27B-INT8-W8A16-MTP",
+  "backend": "barlink",
+  "prompt": "Explain how PCIe peer-to-peer DMA over a GPU BAR1 aperture works, covering TLP routing, IOMMU translation, and why a receiving card's L2 cache is not coherent with inbound writes.",
+  "prompt_tokens": 42,
+  "gen_tokens": 64,
+  "warmup_tokens": 16,
+  "greedy": true,
+  "tok_per_s": 12.764955535292602,
+  "seconds": 5.013726826000493,
+  "prefill_ms": 666.8544409913011,
+  "decode_ms_per_token": 65.60216388722424,
+  "allreduce_calls": 8192,
+  "allreduce_gpu_ms": 658.7799669699743,
+  "peak_mem_gib": 15.358553886413574,
+  "load_s": 9.748225450515747,
+  "sample": "\n\nBelow is a detailed explanation of how PCIe peer-to-peer (P2P) DMA over a GPU BAR1 aperture works, covering TLP routing, IOMMU translation, and the reasons why the receiving card's L2 cache is not coherent with inbound writes.\n\n### 1. Overall Architecture: PCIe Peer"
+}
