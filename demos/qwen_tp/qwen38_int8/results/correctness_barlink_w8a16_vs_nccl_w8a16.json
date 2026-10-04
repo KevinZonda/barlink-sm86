@@ -1,0 +1,14 @@
+{
+  "rank_consistent": {
+    "barlink_w8a16": true,
+    "nccl_w8a16": true
+  },
+  "token_match_rate": 0.40625,
+  "first_divergence": 25,
+  "logits_step0_max_abs_diff": 0.0,
+  "logits_step0_rel_l2": 0.0,
+  "step0_argmax_equal": true,
+  "hidden_step0_max_abs_diff": 0.0,
+  "hidden_step0_rel_l2": 0.0,
+  "passed": true
+}

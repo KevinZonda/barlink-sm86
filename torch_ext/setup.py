@@ -24,6 +24,7 @@ setup(
             sources=[
                 os.path.join(HERE, "barlink_sm86", "core.cu"),
                 os.path.join(HERE, "barlink_sm86", "binding.cpp"),
+                os.path.join(HERE, "barlink_sm86", "w8a16.cu"),
             ],
             include_dirs=[os.path.join(HERE, "barlink_sm86")],
             extra_compile_args={

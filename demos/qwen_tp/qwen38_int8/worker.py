@@ -42,6 +42,14 @@ from collections import defaultdict
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+try:
+    import barlink_sm86 as bl
+except ImportError:      # stock-torch (nccl) branch: no blrun PYTHONPATH
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+        "torch_ext"))
+    import barlink_sm86 as bl
 import torch.nn.functional as F
 
 MODEL_DIR = "/mnt/modelzoo/lued/Qwen3.8-27B-INT8-W8A16-MTP"
@@ -86,16 +94,60 @@ class Int8Linear(nn.Module):
         return y.to(x.dtype).reshape(*sh, self.out_features)
 
 
+class W8A16Linear(nn.Module):
+    """True W8A16 weight-only int8 linear (w8a16.cu): group-128 scales kept
+    EXACT (no per-row refold -- strictly better fidelity than the old dynamic
+    path), activations quantized per token to int8, GEMM via __dp4a with a
+    coalesced chunk-transposed weight layout. 2-3 kernels per call instead of
+    ~10. M > 16 falls back to a dequantized matmul (prefill only)."""
+
+    def __init__(self, wq_t, sw_t, in_features, out_features, dev):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.G = in_features // 128
+        self.register_buffer("wq_t", wq_t)      # int8 [K/16, N, 16]
+        self.register_buffer("sw_t", sw_t)      # fp32 [G, N]
+        # split-K: target ~160+ blocks for SM saturation
+        bx = (out_features + 255) // 256
+        self.S = max(1, min(self.G, (160 * 256) // max(out_features, 1) or 1))
+
+    def forward(self, x):
+        sh = x.shape[:-1]
+        x2 = x.reshape(-1, self.in_features)
+        M = x2.shape[0]
+        if M <= 16:
+            xq, xs = bl._C.w8a16_quant_act(x2)
+            y = bl._C.w8a16_gemm(xq, xs, self.wq_t, self.sw_t,
+                                 self.out_features, self.in_features, self.S)
+            return y.reshape(*sh, self.out_features)
+        # prefill fallback: dequantize (exact int8 x group scale) and matmul
+        wq = self.wq_t.permute(1, 0, 2).reshape(self.out_features,
+                                                self.in_features)
+        w = wq.float() * self.sw_t.repeat_interleave(128, dim=0).t()
+        y = x2.float() @ w.t()
+        return y.to(x.dtype).reshape(*sh, self.out_features)
+
+
 def build_int8_linear(packed_i32, scale_bf16, dev):
-    """Unpack compressed-tensors pack-quantized int8 (stored bias-128, 4
-    bytes per int32 along the input dim, little-endian) and fold the
-    group-128 scales to per-row int8. All math on the GPU."""
+    """Old dynamic-quant path (per-row fold + torch._int_mm). Kept for
+    A/B comparison via QWEN38_W8A16=0."""
     wq = (packed_i32.to(dev).view(torch.int8) ^ -128)      # true int8 [out,in]
     gs = wq.shape[1] // scale_bf16.shape[1]
     w = wq.float() * scale_bf16.to(dev).float().repeat_interleave(gs, dim=1)
     rs = w.abs().amax(dim=1).clamp(min=1e-8) / 127.0
     wq2 = torch.round(w / rs[:, None]).clamp(-127, 127).to(torch.int8)
     return Int8Linear(wq2.contiguous(), rs, wq.shape[1], wq.shape[0])
+
+
+def build_w8a16_linear(packed_i32, scale_bf16, dev):
+    """New W8A16 path: exact unpack + chunk-transposed layout + fp32
+    transposed group scales (bf16 -> fp32 is lossless). No refold."""
+    wq = (packed_i32.to(dev).view(torch.int8) ^ -128)          # [N, K] int8
+    N, K = wq.shape
+    wq_t = wq.view(N, K // 16, 16).permute(1, 0, 2).contiguous()
+    sw_t = scale_bf16.to(dev).float().t().contiguous()         # [G, N] fp32
+    return W8A16Linear(wq_t, sw_t, K, N, dev)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +236,40 @@ class AllGatherLMHead(nn.Module):
 # model construction: meta-init the HF text model, stream real tensors in
 # ---------------------------------------------------------------------------
 
+def shard_w8_col(mod, rank, world=2):
+    # narrow the OUTPUT dim (N): wq_t [K/16, N, 16] dim 1, sw_t [G, N] dim 1
+    N = mod.out_features
+    h = N // world
+    mod.wq_t = mod.wq_t[:, rank * h:(rank + 1) * h, :].contiguous()
+    mod.sw_t = mod.sw_t[:, rank * h:(rank + 1) * h].contiguous()
+    mod.out_features = h
+
+
+def shard_w8_row(mod, rank, world=2):
+    # narrow the INPUT dim (K): wq_t dim 0 (K/16 chunks), sw_t dim 0 (groups)
+    K = mod.in_features
+    h = K // world
+    # NB .contiguous() is a NO-OP on a leading-dim slice (it IS contiguous) --
+    # it would keep the FULL storage alive as a view. clone() really copies.
+    mod.wq_t = mod.wq_t[rank * (h // 16):(rank + 1) * (h // 16)].clone()
+    mod.sw_t = mod.sw_t[rank * (h // 128):(rank + 1) * (h // 128)].clone()
+    mod.in_features = h
+    mod.G = h // 128
+    bx = (mod.out_features + 255) // 256
+    mod.S = max(1, min(mod.G, (160 * 256) // max(mod.out_features, 1) or 1))
+    _hook_rowwise(mod)
+
+
+def qkv_seg(t, rank, kd, vd, fk):
+    # [q | k | v] segmentation along the N dim (dim 1 for both layouts);
+    # works for wq_t [K/16, N, 16] and sw_t [G, N]
+    return torch.cat([
+        t.narrow(1, 0, fk).narrow(1, rank * kd, kd),
+        t.narrow(1, fk, fk).narrow(1, rank * kd, kd),
+        t.narrow(1, 2 * fk, t.shape[1] - 2 * fk).narrow(1, rank * vd, vd),
+    ], dim=1).contiguous()
+
+
 def _meta_text_model():
     from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -234,6 +320,10 @@ def load_and_shard(dev, rank, use_p2p=True, world=2, verbose=False):
 
     n_int8 = 0
     for path, keys in sorted(modkeys.items()):
+        if os.environ.get("QWEN38_MEMDBG") == "1" and (n_int8 % 50 == 0 or (150 <= n_int8 < 166)):
+            print("[memdbg] n=%d alloc=%.2f GiB %s" %
+                  (n_int8, torch.cuda.memory_allocated(dev) / 2**30, path),
+                  flush=True)
         parent_path, _, name = path.rpartition(".")
         parent = lm.get_submodule(parent_path) if parent_path else lm
         if "weight_packed" in keys:
@@ -241,13 +331,29 @@ def load_and_shard(dev, rank, use_p2p=True, world=2, verbose=False):
             ks, fns = keys["weight_scale"]
             kp, fnp = keys["weight_shape"]
             shape = tuple(tensor(kp, fnp).tolist())
-            mod = build_int8_linear(tensor(k, fn), tensor(ks, fns), dev)
+            if os.environ.get("QWEN38_W8A16", "1") == "1":
+                mod = build_w8a16_linear(tensor(k, fn), tensor(ks, fns), dev)
+            else:
+                mod = build_int8_linear(tensor(k, fn), tensor(ks, fns), dev)
             if shape != (mod.out_features, mod.in_features):
                 raise RuntimeError("packed shape mismatch: %s vs %s" %
                                    (shape, (mod.out_features, mod.in_features)))
             # shard IMMEDIATELY: the full-size shard of all layers does not
-            # fit on the card alongside the fold transients
-            if name in COL:
+            # fit on the card alongside the prep transients
+            if os.environ.get("QWEN38_W8A16", "1") == "1":
+                # new W8A16 kernel path
+                if name in ("q_proj", "k_proj", "v_proj", "gate_proj",
+                            "up_proj", "in_proj_z"):
+                    shard_w8_col(mod, rank, world)
+                elif name in ("o_proj", "down_proj", "out_proj"):
+                    shard_w8_row(mod, rank, world)
+                elif name == "in_proj_qkv":
+                    mod.wq_t = qkv_seg(mod.wq_t, rank, kd, vd, fk)
+                    mod.sw_t = qkv_seg(mod.sw_t, rank, kd, vd, fk)
+                    mod.out_features = 2 * kd + vd
+                else:
+                    raise RuntimeError("no shard rule for %s" % path)
+            elif name in COL:
                 shard_int8_col(mod, rank, world)
             elif name in ("o_proj", "down_proj", "out_proj"):
                 shard_int8_row(mod, rank, world)

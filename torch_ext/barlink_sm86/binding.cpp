@@ -15,6 +15,15 @@
 
 #include "core.h"
 
+// w8a16.cu (declared here; definitions in the separate TU)
+extern "C" {
+int bl_w8a16_quant_act(const void *x, void *xq, void *xs, int M, int K,
+                       cudaStream_t stream);
+int bl_w8a16_gemm(const void *wq_t, const void *sw_t, const void *xq,
+                  const void *xs, void *out, void *y32, int M, int N, int K,
+                  int S, cudaStream_t stream);
+}
+
 static blCtx *g_ctx = nullptr;
 static std::vector<int> g_devices;
 static int64_t g_pool_mb = 0;
@@ -416,6 +425,66 @@ void pool_move(at::Tensor src_pool, at::Tensor out)
                          err, sizeof(err)), err);
 }
 
+// --- W8A16 weight-only int8 GEMM (see w8a16.cu) ---------------------------
+
+std::vector<at::Tensor> w8a16_quant_act(at::Tensor x)
+{
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2 &&
+                x.scalar_type() == at::kBFloat16,
+                "barlink_sm86 w8a16_quant_act: x must be a contiguous 2D "
+                "bf16 CUDA tensor");
+    const int M = (int)x.size(0), K = (int)x.size(1);
+    TORCH_CHECK(K % 8 == 0, "barlink_sm86 w8a16_quant_act: K % 8 must be 0");
+    auto xq = at::empty({M, K}, x.options().dtype(at::kChar));
+    auto xs = at::empty({M}, x.options().dtype(at::kFloat));
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+    c10::cuda::CUDAGuard guard(x.get_device());
+    char err[BL_ERRBUF] = {0};
+    if (bl_w8a16_quant_act(x.data_ptr(), xq.data_ptr(), xs.data_ptr(),
+                           M, K, s) != 0) {
+        std::string es = cudaGetErrorString(cudaGetLastError());
+        throw std::runtime_error("barlink_sm86 w8a16_quant_act failed: " + es);
+    }
+    (void)err;
+    return {xq, xs};
+}
+
+// wq_t: int8 [K/16, N, 16] chunk-major transpose; sw_t: fp32 [K/128, N];
+// S: group-split factor (1 = direct bf16 write; >1 = fp32 workspace+atomics)
+at::Tensor w8a16_gemm(at::Tensor xq, at::Tensor xs, at::Tensor wq_t,
+                      at::Tensor sw_t, int64_t N, int64_t K, int64_t S)
+{
+    TORCH_CHECK(xq.is_cuda() && xq.is_contiguous() && xq.dim() == 2 &&
+                xq.scalar_type() == at::kChar,
+                "barlink_sm86 w8a16_gemm: xq must be contiguous int8 [M,K]");
+    const int M = (int)xq.size(0);
+    const int Ki = (int)xq.size(1);
+    TORCH_CHECK(Ki == K && K % 128 == 0,
+                "barlink_sm86 w8a16_gemm: K must match xq and be a multiple "
+                "of 128");
+    TORCH_CHECK(wq_t.is_contiguous() && wq_t.scalar_type() == at::kChar &&
+                sw_t.is_contiguous() && sw_t.scalar_type() == at::kFloat,
+                "barlink_sm86 w8a16_gemm: wq_t int8 / sw_t fp32 contiguous");
+    auto out = at::empty({M, N}, xq.options().dtype(at::kBFloat16));
+    at::Tensor y32;
+    void *y32p = nullptr;
+    cudaStream_t s = at::cuda::getCurrentCUDAStream(xq.get_device()).stream();
+    c10::cuda::CUDAGuard guard(xq.get_device());
+    if (S > 1) {
+        y32 = at::zeros({M, N}, xq.options().dtype(at::kFloat));
+        y32p = y32.data_ptr();
+    }
+    int rc = bl_w8a16_gemm(wq_t.data_ptr(), sw_t.data_ptr(), xq.data_ptr(),
+                           xs.data_ptr(), out.data_ptr(), y32p,
+                           M, (int)N, Ki, (int)S, s);
+    if (rc != 0) {
+        std::string es = cudaGetErrorString(cudaGetLastError());
+        throw std::runtime_error("barlink_sm86 w8a16_gemm failed rc=" +
+                                 std::to_string(rc) + ": " + es);
+    }
+    return out;
+}
+
 at::Tensor debug_flags()
 {
     TORCH_CHECK(g_ctx, "barlink_sm86: not initialized -- call bl.init() first");
@@ -480,4 +549,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::call_guard<py::gil_scoped_release>());
     m.def("debug_flags", &debug_flags, py::call_guard<py::gil_scoped_release>());
     m.def("pool_move", &pool_move, py::call_guard<py::gil_scoped_release>());
+    m.def("w8a16_quant_act", &w8a16_quant_act,
+          py::call_guard<py::gil_scoped_release>());
+    m.def("w8a16_gemm", &w8a16_gemm, py::arg("xq"), py::arg("xs"),
+          py::arg("wq_t"), py::arg("sw_t"), py::arg("N"), py::arg("K"),
+          py::arg("S"),
+          py::call_guard<py::gil_scoped_release>());
 }

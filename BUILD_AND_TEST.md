@@ -386,7 +386,25 @@ rel_l2 = 0.0）。结果（`QWEN38_TAG_SUFFIX=_fla`，与旧结果并存 results
 |---|---|---|---|---|
 | 原生 torch GDN | 8.03 | 8.03 | 8.95 / 8.93 | 12.8 ms/token |
 | fla 优化 GDN | 7.95（7.82–7.98） | 8.11（8.02–8.11） | 8.80 / 8.97 | 13.2 ms/token |
-| **fused 小消息协议**（≤64KB，10-04） | **8.11** | 8.01 | 8.83 / 8.99 | **10.0 ms/token** |
+| fused 小消息协议（≤64KB） | 8.11 | 8.01 | 8.83 / 8.99 | 10.0 ms/token |
+| **+ W8A16 weight-only kernel**（10-04） | **12.57** | **12.36** | — | — |
+
+**W8A16 weight-only int8 kernel**（`torch_ext/barlink_sm86/w8a16.cu`，替换
+per-row fold + 动态量化 + `_int_mm` 的 ~10 kernel/Linear 自研路径）：权重保持
+checkpoint 原样的 group-128 int8 + fp32 scale（**不再二次量化，精度只升不降**），
+加载时转置分块 `[K/16,N,16]`（warp 内 16B/lane 全 coalesced）+ scale 转置
+`[G,N]`；激活 bf16 per-token 量化一个 kernel；GEMM thread-per-row、`__dp4a`、
+K 按 group 切 S 片（S>1 走 fp32 workspace + atomicAdd + cast）；M 模板
+{1,4,16} 覆盖 decode。每 Linear 2–3 kernel。正确性：全 decode shape（含
+lm_head 的 124160×5120）vs fp64 参考 rel_l2 ≈ 0.00165（per-token int8 量化
+误差底），S/M 全组合通过（`torch_ext/tests/test_w8a16.py`）。端到端 decode
+66.8 ms/token（原 122–132），tok/s **+55%**（barlink 8.11→12.57，NCCL
+8.01→12.36，干净卡）。与旧路径 token 序列在首 token 后分叉（双量化 vs 精确
+group 权重的 ~1% logit 差 → near-tie 翻转），两侧输出均连贯正确；barlink vs
+NCCL 的 step-0 logits 仍逐位一致（S>1 的 atomic 顺序引入 ±1ulp 级差异，后续
+greedy 漂移）。`QWEN38_W8A16=0` 回退旧路径。lm_head 默认仍 bf16（保持
+checkpoint 精度，kernel 已覆盖其 shape）。下一步富矿：decode step 的 CUDA
+graph 捕获（barlink fused 协议已 replay-safe，自定义 harness 可直接套）。
 
 fla 没带来端到端提速：GDN 原生路径只占每 token kernel 数的 ~13%（32.5k →
 28.7k，省 ~5ms device 时间，被 ±5% 运行噪声淹没）。瓶颈在量化 wrapper 与
