@@ -1,0 +1,14 @@
+{
+  "backend": "barlink",
+  "shim_off": null,
+  "prompt_tokens": 16384,
+  "prompts": 1,
+  "gen_tokens": 1024,
+  "wall_s": 37.596732988982694,
+  "tps": 27.236409086397796,
+  "decode_tps": 40.048299953341136,
+  "prefill_s": 12.027607677970082,
+  "warm_wall_s": 25.569125311012613,
+  "enforce_eager": false,
+  "sample": " access between graphics processors over the peripheral component interconnect express bus, bypassing host memory entirely. The system uses peer to peer direct "
+}
