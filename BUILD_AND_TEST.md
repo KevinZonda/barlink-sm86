@@ -638,6 +638,26 @@ API）或静默数据错位。旧记录 "~4.4s 上下文死亡"。
   （写侧写全部桶，读侧任一通顺桶即可），消除单点粘死。
 
 复现/验证：`torch_ext/tests/repro_p2p_big.py`（48/64/128MB 全双工
+
+**2026-10-05 MTP 崩溃排查记录（barlink + vLLM MTP 仍阻塞，根因已定位）**：
+- 症状：vLLM 0.30 + Qwen3.8-27B-MTP（mtp/n=3/mns=1/fp8 KV）在第一个
+  decode 步的 `speculator.propose → _multi_step_decode` 硬崩（worker 进程
+  直接死 / unspecified launch failure）。eager 与 graph 同样崩溃（排除
+  捕获）；NCCL backend 正常 → 只与 barlink 通信有关。
+- 根因（printf 坐实）：draft lm_head 的 allgather 走 p2p send/recv，
+  MTP 使 p2p 交换频率提高一个量级（每 token 4+ 次 1-2MB 全双工交换），
+  在 ~op30-55 处必现 `p2p_recv FLAG TIMEOUT want=N cur=N-1` —— 即上一节
+  的"对端写入控制槽本端轮询不可见"（stale L2 行粘死）病理在高频下被
+  触发。decode harness 的低频用法只是罕见 near-tie，MTP 是必现。
+- 试过的修法与结果：(a) 原子读（atom.add 0）做轮询 —— 值新鲜但**饿死
+  入向写**（atomic 与 BAR 写共享 L2 资源，对端 payload/flag 停止落地），
+  全部路径退化，放弃；(b) 8 桶轮换（写侧写 8 份 256B 间隔副本、读侧取
+  max）——方向正确，但调试期间**双卡 PCIe 链路降级到 Gen1 x8**（
+  nvidia-smi 可见 link.gen.current=1；疑似长时间 trap/atomic 风暴后的
+  链路重训练），1MB 交换在 Gen1 下病理必现，桶方案的测试结果全部无效。
+  恢复 Gen3 需重启（无 sudo 无法 gpu-reset）。**重启后优先重验桶方案**。
+- 当前 shipped 状态 = fc24991（Gen3 链路上全绿；Gen1 链路上 p2p 回归
+  也会偶发 want=N cur=N-1，勿在链路降级状态下评判协议改动）。
 isend/irecv，rank-seeded 字节级校验；`--halfduplex` 半双工对照）。isend/irecv，rank-seeded 字节级校验；`--halfduplex` 半双工对照）。
 2. **CUDA graph 捕获**：隔离复现（裸 CUDAGraph + dist.all_reduce，fused 和
    旧路径、单次/重复 replay）**全部通过**；但在 vllm piecewise 捕获里
