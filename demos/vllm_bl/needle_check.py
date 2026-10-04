@@ -52,13 +52,14 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     prompt = tok.apply_chat_template(
         [{"role": "user", "content": doc + "\n\n" + QUESTION}],
-        tokenize=False, add_generation_prompt=True)
+        tokenize=False, add_generation_prompt=True,
+        enable_thinking=os.environ.get("NEEDLE_THINK", "0") != "1")
 
     llm = LLM(model=MODEL, tensor_parallel_size=2,
               gpu_memory_utilization=0.93, max_model_len=262144,
               max_num_seqs=1, kv_cache_dtype="fp8_e4m3",
               enable_chunked_prefill=True)
-    sp = SamplingParams(temperature=0, max_tokens=32)
+    sp = SamplingParams(temperature=0, max_tokens=int(os.environ.get("NEEDLE_MAXTOK", "800")))
     out = llm.generate([prompt], sp)[0].outputs[0].text
     ok = "ZETA-7741-QUANTUM" in out
     print("NEEDLE2 RESULT depth=%.2f haystack_words=%d ok=%s" %
