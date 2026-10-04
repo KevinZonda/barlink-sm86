@@ -134,6 +134,18 @@ class BarlinkBackend(_C10D.Backend):
     def allreduce(self, tensors, opts):
         self._dbg("allreduce", tuple(tensors[0].shape), tensors[0].dtype,
                   tensors[0].is_cuda)
+        if os.environ.get("BL_AR_TRACE") == "1":
+            t = tensors[0]
+            cs = 0.0
+            try:
+                cs = t.float().sum().item()   # sync debug only
+            except Exception:
+                pass
+            import torch as _tt
+            sys.stderr.write(
+                "[bltrace] rank=%d ar shape=%s ptr=%x stream=%s insum=%.4f\n" %
+                (self.rank(), tuple(t.shape), t.data_ptr(),
+                 _tt.cuda.current_stream(), cs))
         op = getattr(opts, "reduceOp", None)
         if op is not None and op != dist.ReduceOp.SUM:
             raise RuntimeError(
@@ -170,6 +182,8 @@ class BarlinkBackend(_C10D.Backend):
                   torch.float8_e4m3fn, torch.float8_e5m2)
 
     def _zero_copy_usable(self, t):
+        if os.environ.get("BL_AR_NO_ZC") == "1":
+            return False     # diagnostic: force the pool staging path
         return (t.is_cuda and t.dtype in self._ZC_DTYPES and
                 t.is_contiguous() and t.numel() > 0 and
                 t.data_ptr() % 16 == 0 and
