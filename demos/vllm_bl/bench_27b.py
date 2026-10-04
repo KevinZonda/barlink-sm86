@@ -16,6 +16,10 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=1024)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--max-num-seqs", type=int, default=16)
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help=">0: single synthetic prompt of ~N tokens "
+                         "(overrides the fixed multi-prompt set)")
+    ap.add_argument("--out-json", type=str, default="")
     a = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -31,6 +35,13 @@ def main():
         "Give a detailed technical comparison of RDMA, GPUDirect, and PCIe "
         "BAR based inter-GPU communication mechanisms.",
     ]
+    if a.prompt_tokens > 0:
+        # ~1 token/word: repetitive technical text repeated to the target len.
+        unit = ("The system uses peer to peer direct memory access between "
+                "graphics processors over the peripheral component "
+                "interconnect express bus, bypassing host memory entirely. ")
+        reps = a.prompt_tokens // len(unit.split()) + 1
+        PROMPTS = [" ".join((unit * reps).split()[:a.prompt_tokens])]
 
     llm = LLM(model=MODEL,
               tensor_parallel_size=2,
@@ -47,16 +58,36 @@ def main():
     n_prompts = len(PROMPTS)
     gen_tokens = sum(len(o.outputs[0].token_ids) for o in outs)
     tps = gen_tokens / wall
+    # decode-only TPS from per-request first/last token timestamps
+    dec = []
+    for o in outs:
+        m = getattr(o, "metrics", None)
+        ft, lt = getattr(m, "first_token_time", None), getattr(m, "last_token_time", None)
+        n = len(o.outputs[0].token_ids)
+        if ft and lt and n > 1 and lt > ft:
+            dec.append((n - 1) / (lt - ft))
+    decode_tps = sum(dec) / len(dec) if dec else None
+    prefill_s = None
+    if dec:
+        m0 = outs[0].metrics
+        arr = getattr(m0, "arrival_time", None)
+        if arr and m0.first_token_time:
+            prefill_s = m0.first_token_time - arr
     first = outs[0].outputs[0].text[:160].replace("\n", " ")
     print("BENCH RESULT backend_env_shim_off=%s prompts=%d gen_tokens=%d "
-          "wall=%.2fs tps=%.2f" % (os.environ.get("BL_SHIM_OFF"), n_prompts,
-                                   gen_tokens, wall, tps), flush=True)
+          "wall=%.2fs tps=%.2f decode_tps=%s prefill_s=%s" %
+          (os.environ.get("BL_SHIM_OFF"), n_prompts,
+           gen_tokens, wall, tps, decode_tps, prefill_s), flush=True)
     print("SAMPLE: %s" % first, flush=True)
     tag = "nccl" if os.environ.get("BL_SHIM_OFF") == "1" else "barlink"
-    with open("demos/vllm_bl/bench27b_%s.json" % tag, "w") as f:
+    out = a.out_json or ("demos/vllm_bl/bench27b_%s.json" % tag)
+    with open(out, "w") as f:
         json.dump({"backend": tag, "shim_off": os.environ.get("BL_SHIM_OFF"),
-                   "prompts": n_prompts, "gen_tokens": gen_tokens,
-                   "wall_s": wall, "tps": tps, "enforce_eager": os.environ.get("ENFORCE_EAGER") == "1",
+                   "prompt_tokens": a.prompt_tokens, "prompts": n_prompts,
+                   "gen_tokens": gen_tokens,
+                   "wall_s": wall, "tps": tps, "decode_tps": decode_tps,
+                   "prefill_s": prefill_s,
+                   "enforce_eager": os.environ.get("ENFORCE_EAGER") == "1",
                    "sample": first}, f, indent=2)
 
 
