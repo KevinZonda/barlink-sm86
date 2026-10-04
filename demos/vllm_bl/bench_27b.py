@@ -20,6 +20,9 @@ def main():
                     help=">0: single synthetic prompt of ~N tokens "
                          "(overrides the fixed multi-prompt set)")
     ap.add_argument("--out-json", type=str, default="")
+    ap.add_argument("--warm-repeat", type=int, default=0,
+                    help=">0: run the same request N extra times (prefix cache "
+                         "hit -> wall is decode-dominated); reports min wall")
     a = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -73,11 +76,25 @@ def main():
         arr = getattr(m0, "arrival_time", None)
         if arr and m0.first_token_time:
             prefill_s = m0.first_token_time - arr
+    # prefix-cache re-run: wall is decode-dominated
+    warm_wall = None
+    if a.warm_repeat > 0:
+        for _ in range(a.warm_repeat):
+            tw0 = time.perf_counter()
+            outs2 = llm.generate(PROMPTS, sp)
+            tw = time.perf_counter() - tw0
+            warm_wall = tw if warm_wall is None else min(warm_wall, tw)
+        gen2 = sum(len(o.outputs[0].token_ids) for o in outs2)
+        if decode_tps is None and gen2 == gen_tokens and warm_wall > 0:
+            decode_tps = gen_tokens / warm_wall
+            if prefill_s is None:
+                prefill_s = wall - warm_wall
     first = outs[0].outputs[0].text[:160].replace("\n", " ")
     print("BENCH RESULT backend_env_shim_off=%s prompts=%d gen_tokens=%d "
-          "wall=%.2fs tps=%.2f decode_tps=%s prefill_s=%s" %
+          "wall=%.2fs tps=%.2f decode_tps=%s prefill_s=%s warm_wall=%s" %
           (os.environ.get("BL_SHIM_OFF"), n_prompts,
-           gen_tokens, wall, tps, decode_tps, prefill_s), flush=True)
+           gen_tokens, wall, tps, decode_tps, prefill_s,
+          "%.2f" % warm_wall if warm_wall else None), flush=True)
     print("SAMPLE: %s" % first, flush=True)
     tag = "nccl" if os.environ.get("BL_SHIM_OFF") == "1" else "barlink"
     out = a.out_json or ("demos/vllm_bl/bench27b_%s.json" % tag)
@@ -86,7 +103,7 @@ def main():
                    "prompt_tokens": a.prompt_tokens, "prompts": n_prompts,
                    "gen_tokens": gen_tokens,
                    "wall_s": wall, "tps": tps, "decode_tps": decode_tps,
-                   "prefill_s": prefill_s,
+                   "prefill_s": prefill_s, "warm_wall_s": warm_wall,
                    "enforce_eager": os.environ.get("ENFORCE_EAGER") == "1",
                    "sample": first}, f, indent=2)
 
