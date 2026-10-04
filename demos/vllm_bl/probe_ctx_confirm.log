@@ -1,0 +1,5 @@
+##### probe mtp3 max_model_len=40960 Mon Oct  5 00:22:08 CST 2026
+##### mtp3 rc=0 GPU KV cache size: 41,959 tokens
+##### probe nomtp max_model_len=65536 Mon Oct  5 00:24:56 CST 2026
+##### nomtp rc=0 GPU KV cache size: 132,437 tokens
+##### confirm probes done Mon Oct  5 00:27:52 CST 2026

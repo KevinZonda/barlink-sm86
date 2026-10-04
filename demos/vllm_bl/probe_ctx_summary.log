@@ -1,0 +1,13 @@
+##### probing max_model_len=32768 Mon Oct  5 00:12:08 CST 2026
+##### LEN=32768 rc=0 GPU KV cache size: 38,229 tokens 
+##### probing max_model_len=65536 Mon Oct  5 00:14:56 CST 2026
+##### LEN=65536 rc=1  
+(EngineCore pid=193382) ERROR 10-05 00:17:16 [core.py:1366] EngineCore failed to start.
+(EngineCore pid=193382) ERROR 10-05 00:17:16 [core.py:1366] Traceback (most recent call last):
+(EngineCore pid=193382) ERROR 10-05 00:17:16 [core.py:1366]   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv-vllm/lib/python3.14/site-packages/vllm/v1/engine/core.py", line 1328, in run_engine_core
+##### probing max_model_len=98304 Mon Oct  5 00:17:24 CST 2026
+##### LEN=98304 rc=1  
+(EngineCore pid=194318) ERROR 10-05 00:20:01 [core.py:1366] EngineCore failed to start.
+(EngineCore pid=194318) ERROR 10-05 00:20:01 [core.py:1366] Traceback (most recent call last):
+(EngineCore pid=194318) ERROR 10-05 00:20:01 [core.py:1366]   File "/home/kevin/projects/nv-p2p/barlink-torch/.venv-vllm/lib/python3.14/site-packages/vllm/v1/engine/core.py", line 1328, in run_engine_core
+##### probing max_model_len=131072 Mon Oct  5 00:20:09 CST 2026
