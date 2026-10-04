@@ -3022,6 +3022,7 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
 // raised after its payload) and +8 consumed-receipt (w was the RECEIVER,
 // raised after its move kernel finished reading the scratch).
 #define BL_P2P_SLOT(writerRank) (2 + (writerRank))
+#define BL_P2P_TURN_SLOT 11   // big p2p flood-direction turn marker
 
 // Lazily create the p2p send stream + event (non-blocking stream, no timing
 // event). The send stream is needed because several sends posted before the
@@ -3092,21 +3093,64 @@ __global__ void k_p2p_bump(unsigned long long *exp)
         redadd64(exp, 1);
 }
 
+// payload -> peer p2p zone, last block raises the peer's completion flag.
+// The flag is a POSTED .wt write of this op's ordinal (read from the local
+// receiptExp device counter at kernel time -- replay-safe, not a baked
+// host seq), NOT a red.add: posted payload stores and posted flag stores
+// stay in order on the single-source PCIe path, so the flag cannot
+// overtake the payload (a red.add atomic is unordered against posted
+// writes -- at 248KB the next kernel's launch latency masks the race, at
+// 47MB it corrupts whole chunks). The receiver waits flag >= its mirrored
+// flagExp, which compares equal to this ordinal. No __threadfence_system:
+// kernel boundary + in-order posted delivery order the payload ahead of
+// the flag, and the fence would otherwise wait seconds for BAR write
+// completions (see k_mark's note).
 __global__ void k_p2p_send(const uint4 *__restrict__ in,
                            uint4 *__restrict__ peerScr,
                            const unsigned long long *__restrict__ receipt,
                            const unsigned long long *__restrict__ receiptExp,
                            unsigned long long *__restrict__ flagBar,
                            unsigned long long *__restrict__ elect,
-                           size_t n4)
+                           size_t n4,
+                           const unsigned long long *__restrict__ turnLocal,
+                           unsigned long long turnWant)
 {
-    if (receipt)
-        spin_until(receipt, ldseq(receiptExp) - 1);
+    if (turnLocal) {
+        // flood-direction turn taking (multi-chunk big p2p): wait the
+        // peer's done marker for the previous turn before flooding.
+        // Cross-direction control writes are unreliable while BOTH GPUs
+        // flood each other on this platform, so big messages strictly
+        // alternate their payload floods.
+        const long long t0 = clock64();
+        while (ldseq(turnLocal) < turnWant) {
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000)
+                __trap();
+        }
+    }
+    if (receipt) {
+        const unsigned long long gate = ldseq(receiptExp) - 1;
+        const long long t0 = clock64();
+        unsigned long long polls = 0;
+        while (ldseq(receipt) < gate) {
+            // if the PREVIOUS op's flag (== this op's ordinal - 1, whose
+            // payload kernel has completed -- stream order) was lost under
+            // the peer's flood, the peer's current recv is spinning on it
+            // and will never post the receipt this gate waits for: re-post
+            // it (idempotent, monotone-safe -- the slot cannot have
+            // advanced past it while this op is gated)
+            if (gate > 0 && (++polls & 0xFFFFull) == 0)
+                stwt64(flagBar, gate);
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) {
+                printf("p2p_send GATE TIMEOUT want=%llu cur=%llu\n",
+                       gate, ldseq(receipt));
+                __trap();
+            }
+        }
+    }
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride)
         stwt128(&peerScr[i], in[i]);
-    __threadfence_system();
     __shared__ int isLast;
     if (threadIdx.x == 0) {
         unsigned long long old;
@@ -3115,39 +3159,53 @@ __global__ void k_p2p_send(const uint4 *__restrict__ in,
         isLast = (old == (unsigned long long)gridDim.x - 1);
         if (isLast) {
             if (flagBar)
-                redadd64(flagBar, 1);
+                stwt64(flagBar, ldseq(receiptExp));
             *elect = 0;   // next op's kernel starts after this one completes
         }
     }
     __syncthreads();
 }
 
+// wait the peer's flag, move the scratch out. The consumption receipt is
+// NOT posted here: it goes in a separate kernel after this one (see
+// bl_recv_into_peer), because a grid-wide move's reads must ALL be complete
+// before the sender may overwrite the scratch -- and an in-kernel
+// last-block election only proves every block passed its fence, not that
+// every block's loads retired before a fast follow-on payload overtook
+// them (observed 2026-10-04: page-0 tearing when a 1MB second chunk
+// overwrote the scratch while a 47MB move was still reading it).
 __global__ void k_p2p_recv(uint4 *__restrict__ out,
                            const uint4 *__restrict__ scr,
                            const unsigned long long *__restrict__ flag,
                            const unsigned long long *__restrict__ flagExp,
-                           unsigned long long *__restrict__ receiptBar,
-                           unsigned long long *__restrict__ elect,
+                           unsigned long long *__restrict__ reackBar,
                            size_t n4)
 {
-    spin_until(flag, ldseq(flagExp));
+    {
+        const unsigned long long want = ldseq(flagExp);
+        const long long t0 = clock64();
+        unsigned long long polls = 0;
+        while (ldseq(flag) < want) {
+            // a receipt lost under the peer's payload flood would wedge
+            // the peer's next overwrite gate with nobody left to re-post
+            // it -- re-post the previous chunk's receipt (absolute mark)
+            // while waiting. Read-before-write: the slot counts the
+            // PEER'S recv ops (an independent stream) and may legitimately
+            // be ahead of this ordinal -- never write a smaller value.
+            if (want > 1 && (++polls & 0xFFFFull) == 0 &&
+                ldseq(reackBar) < want - 1)
+                stwt64(reackBar, want - 1);
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) {
+                printf("p2p_recv FLAG TIMEOUT want=%llu cur=%llu\n",
+                       want, ldseq(flag));
+                __trap();
+            }
+        }
+    }
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride)
         out[i] = ldcs128(&scr[i]);
-    __threadfence_system();
-    __shared__ int isLast;
-    if (threadIdx.x == 0) {
-        unsigned long long old;
-        asm volatile("atom.global.add.u64 %0, [%1], %2;"
-                     : "=l"(old) : "l"(elect), "l"(1ULL) : "memory");
-        isLast = (old == (unsigned long long)gridDim.x - 1);
-        if (isLast) {
-            redadd64(receiptBar, 1);
-            *elect = 0;
-        }
-    }
-    __syncthreads();
 }
 
 // my pool's local p2p state pointers (see layout note above)
@@ -3163,6 +3221,25 @@ static void p2pLocalSlots(blCtx *ctx, unsigned long long **flagExp,
     if (receiptExp) *receiptExp = base + 1;
     if (sendElect)  *sendElect  = base + 2;
     if (recvElect)  *recvElect  = base + 3;
+}
+
+// diag-tagged wait for the counter-protocol gate/flag (trap printf)
+__global__ void k_p2p_wait_dbg(const unsigned long long *__restrict__ flag,
+                               unsigned long long seq, int tag)
+{
+    if (threadIdx.x == 0) {
+        const long long t0 = clock64();
+        for (;;) {
+            unsigned long long v = ldseq(flag);
+            if (v >= seq) break;
+            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) {
+                printf("p2p_wait TIMEOUT tag=%d seq=%llu cur=%llu\n",
+                       tag, seq, v);
+                __trap();
+            }
+        }
+    }
+    __syncthreads();
 }
 
 // Shared prologue for the zero-copy p2p pair: peer-mode/context checks,
@@ -3221,6 +3298,21 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
                                  int dtype, int peerRank, void *stream,
                                  char *err, size_t errlen)
 {
+    return bl_send_into_peer_turn(ctx, inPtr, bytes, dtype, peerRank, stream,
+                                  0, 0, err, errlen);
+}
+
+// turn_want > 0: this op is part of a turn-taking multi-chunk message --
+// the payload flood waits the peer's turn slot (see k_p2p_send), and the
+// completion mark ALSO writes the peer's turn slot with turn_want (the
+// "done" marker releasing the peer's next turn).
+extern "C" int bl_send_into_peer_turn(blCtx *ctx, const void *inPtr,
+                                      size_t bytes, int dtype, int peerRank,
+                                      void *stream,
+                                      unsigned long long turnWant,
+                                      unsigned long long turnMark,
+                                      char *err, size_t errlen)
+{
     setErr(err, errlen, "");
     void *bar = nullptr;
     uint64_t seq = 0;
@@ -3255,6 +3347,12 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
         myP.dptr + flagOff(myP, BL_P2P_SLOT(peer)) + 8);
     unsigned long long *peerFlagBar = (unsigned long long *)((uint8_t *)bar +
         flagOff(ctx->pools[peer], BL_P2P_SLOT(me)));
+    // turn-taking slot (multi-chunk big p2p): my pool's slot 11[0] is
+    // written by the PEER's done marker; I read it locally
+    unsigned long long *myTurnLocal = (unsigned long long *)(uintptr_t)(
+        myP.dptr + flagOff(myP, BL_P2P_TURN_SLOT));
+    unsigned long long *peerTurnBar = (unsigned long long *)((uint8_t *)bar +
+        flagOff(ctx->pools[peer], BL_P2P_TURN_SLOT));
     if (std::getenv("BL_P2P_NO_RECEIPT"))
         myReceipt = nullptr;
     unsigned long long *flagOut = std::getenv("BL_P2P_NO_MARK")
@@ -3270,7 +3368,9 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
         k_p2p_bump<<<1, 1, 0, cs>>>(receiptExp);
         k_p2p_send<<<gridBlocks(n4d, myOrd), 256, 0, cs>>>(
             (const uint4 *)inPtr, (uint4 *)peerScratch, myReceipt, receiptExp,
-            flagOut, sendElect, n4d);
+            flagOut, sendElect, n4d, myTurnLocal, turnWant);
+        if (turnMark)
+            k_mark<<<1, 1, 0, cs>>>(peerTurnBar, turnMark);
         if (cudaGetLastError() != cudaSuccess) {
             setErr(err, errlen,
                    "bl_send_into_peer: caller-stream launch failed");
@@ -3296,7 +3396,9 @@ extern "C" int bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes,
     k_p2p_bump<<<1, 1, 0, ss>>>(receiptExp);
     k_p2p_send<<<gridBlocks(n4, myOrd), 256, 0, ss>>>(
         (const uint4 *)inPtr, (uint4 *)peerScratch, myReceipt, receiptExp,
-        flagOut, sendElect, n4);
+        flagOut, sendElect, n4, myTurnLocal, turnWant);
+    if (turnMark)
+        k_mark<<<1, 1, 0, ss>>>(peerTurnBar, turnMark);
     if (cudaEventRecord(ctx->evSend, ss) != cudaSuccess ||
         cudaGetLastError() != cudaSuccess) {
         std::string es = cudaGetErrorString(cudaGetLastError());
@@ -3343,7 +3445,11 @@ extern "C" int bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes,
     k_p2p_recv<<<gridBlocks(n4, myOrd), 256, 0, s>>>(
         (uint4 *)outPtr,
         (const uint4 *)(uintptr_t)(myP.dptr + ctx->p2pScratchBase),
-        myFlag, flagExp, peerReceiptBar, recvElect, n4);
+        myFlag, flagExp, peerReceiptBar, n4);
+    // consumption receipt in a separate kernel: it may only fire after the
+    // move kernel has FULLY completed (kernel boundary), or the next
+    // payload can overwrite the scratch while this move is still reading
+    k_p2p_bump<<<1, 1, 0, s>>>(peerReceiptBar);
     if (cudaGetLastError() != cudaSuccess) {
         setErr(err, errlen, "bl_recv_into_peer: kernel launch failed");
         return -1;

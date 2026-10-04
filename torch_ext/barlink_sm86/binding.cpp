@@ -358,7 +358,8 @@ static void p2pCheck(const at::Tensor &t, size_t *bytesOut)
     *bytesOut = bytes;
 }
 
-void send_into(at::Tensor t, int64_t peer_rank)
+void send_into(at::Tensor t, int64_t peer_rank, int64_t turn_want,
+               int64_t turn_mark)
 {
     size_t bytes = 0;
     p2pCheck(t, &bytes);
@@ -367,8 +368,11 @@ void send_into(at::Tensor t, int64_t peer_rank)
     c10::cuda::CUDAGuard guard(t.get_device());
     char err[BL_ERRBUF] = {0};
     // dtype is a pure byte move; the enum is validated in core, pass U8
-    blCheck(bl_send_into_peer(g_ctx, t.data_ptr(), bytes, BL_DTYPE_U8,
-                              (int)peer_rank, (void *)s, err, sizeof(err)),
+    blCheck(bl_send_into_peer_turn(g_ctx, t.data_ptr(), bytes, BL_DTYPE_U8,
+                                   (int)peer_rank, (void *)s,
+                                   (unsigned long long)turn_want,
+                                   (unsigned long long)turn_mark,
+                                   err, sizeof(err)),
             err);
 }
 
@@ -540,6 +544,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("allreduce_into", &allreduce_into, py::arg("out"), py::arg("in"),
           py::call_guard<py::gil_scoped_release>());
     m.def("send_into", &send_into, py::arg("t"), py::arg("peer_rank"),
+          py::arg("turn_want") = 0, py::arg("turn_mark") = 0,
           py::call_guard<py::gil_scoped_release>());
     m.def("recv_into", &recv_into, py::arg("t"), py::arg("peer_rank"),
           py::call_guard<py::gil_scoped_release>());

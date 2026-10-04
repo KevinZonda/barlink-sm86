@@ -115,6 +115,14 @@ int  bl_allreduce_into_peer(blCtx *ctx, const void *inPtr, void *outPtr,
 // stream while the peer's send waits for exactly that mark.
 int  bl_send_into_peer(blCtx *ctx, const void *inPtr, size_t bytes, int dtype,
                        int peerRank, void *stream, char *err, size_t errlen);
+// turn-taking variant for multi-chunk big p2p: turnWant > 0 gates the
+// payload flood on the peer's turn slot; turnMark > 0 also writes that
+// slot with turnMark (the "done" marker releasing the peer's next turn)
+int  bl_send_into_peer_turn(blCtx *ctx, const void *inPtr, size_t bytes,
+                            int dtype, int peerRank, void *stream,
+                            unsigned long long turnWant,
+                            unsigned long long turnMark,
+                            char *err, size_t errlen);
 int  bl_recv_into_peer(blCtx *ctx, void *outPtr, size_t bytes, int dtype,
                        int peerRank, void *stream, char *err, size_t errlen);
 

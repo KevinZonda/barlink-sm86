@@ -589,10 +589,56 @@ PATH="$PWD/.venv-vllm/bin:$PATH" ENFORCE_EAGER=1 BL_SKIP_INIT=1 BL_POOL_MB=192 \
    大消息（>1MB）的 op 延迟是秒级；已从 `k_mark` 移除 fence（冗余且有害：
    kernel 边界 + 单源 PCIe 保序已足够，全回归通过）；所有 flag 等待超时
    提到 ~200e9 时钟。小消息（≤64KB，LLM decode 场景）不受影响（10KB
-   allreduce 仍 ~19µs）。**多 chunk 全双工 p2p（>32MB 分片）有一个未解的
-   flag 送达病理（~4.4s 上下文死亡，coredump 显示 k_flag_wait SIGTRAP 但
-   时序对不上任何超时预算）** —— PG 层 p2p 分片因此上限提到整区（47MB，
-   单 chunk），大消息走单 chunk（慢但正确）。
+   allreduce 仍 ~19µs）。
+   **多 chunk 全双工 p2p（>47MB 分片）病理 2026-10-04 已根因定位并修复**
+   （见下节）。
+
+### 多 chunk 全双工 p2p 病理：根因与缓解（2026-10-05）
+
+症状：>47MB 消息分片全双工交换（两 rank 同时 isend/irecv）在几十秒内
+SIGTRAP（`k_flag_wait`/`__trap`，CUDA_ERROR_LAUNCH_FAILED 冒泡到下一个
+API）或静默数据错位。旧记录 "~4.4s 上下文死亡"。
+
+**根因**（新协议上重现实验逐层坐实， dual 3080 + IOMMU=pt）：
+- 病理在 replay-safe 设备计数器协议（3ac75dc）上原样存在，不是旧 host
+  序号的 bug。
+- **单方向洪泛完全干净**：半双工多 chunk 字节逐位正确（40/47MB 单
+  chunk 全双工 ×3 也逐位正确）。只有双向同时 BAR 写入压力会出事。
+- 出事的微观形态：对端写入的 flag/回执计数器**对本端轮询读不可见**——
+  本端 `ld.relaxed.sys` 自旋读到停滞值（实际已推进），写侧重发也无效
+  （写的是内存，读侧 L2 行粘住）。伴随表现为计数器"回退"（读到 1 实际
+  已到 2）与 trap。`red.global.add`（atomic）与 `st.global.wt`（posted）
+  两种传输都会触发；小 payload（≤8MB 回归、decode 的 248KB）因为核间
+  启动延迟掩盖读窗，从不触发。
+- 途中还修掉三个叠加的真实 bug（都不是平台病理，但都被病理 masking）：
+  ① 3ac75dc 把 p2p flag 从 st.wt 绝对值改成 red.add 计数器——atomic
+  对 posted payload **无序**，大 chunk 的 flag 可越过 payload（248KB 被
+  启动延迟掩盖，47MB 必现撕裂）；改回 st.wt 绝对序数值（设备计数器读值，
+  仍 replay-safe）。② 消费回执在 move 核内 last-block 选举触发——只证明
+  各 block 过了 fence，不证明 load 全部完成；chunk k+1 的 payload 会在
+  chunk k 的 move 读途中覆写 scratch（页 0 撕裂缝定复现）；回执移到
+  move 核之后的独立核（kernel 边界 = 全部读完成）。③ python 分片流的
+  握手/序号对齐错误（单侧握手使 flag 序号错配；双侧握手使 irecv 侧
+  token recv 的回执提前释放 chunk 覆写门）。
+
+**缓解**（plan B 精神：承认平台双向控制面不可靠，绕开它）：
+- 多 chunk 消息（>47MB）的 payload 洪泛**严格轮流**（`_p2p_zerocopy`
+  多 chunk 分支 + `bl_send_into_peer_turn` 的 slot 11 轮转标记）：rank0
+  的整条消息先洪泛，最后一个 chunk 的完成标记同时释放 rank1 的轮转；
+  反之亦然。任何时刻线上只有一个方向的 BAR 洪泛，控制面写全部落在
+  静窗口。
+- 握手只在 isend 侧做一次（两个 rank 都在 SPMD 下调用 isend），保持
+  send/recv op 序号 1:1 对齐。
+- 罕见的控制写丢失由幂等重发兜底：发送门自旋重发上一 op 的 flag
+  （绝对值，流序保证不大于当前），接收等待自旋重发上一 chunk 的回执
+  （读-后写，绝不写小于现值的数）。
+- 残留风险：极端情况下轮询读侧 L2 行粘死（平台病理本身），表现为
+  ~100s 后的响亮 trap（**不会静默错数据**——洪泛已串行化，覆写 pacing
+  由 kernel 边界回执保证）。后续修复方向：flag/回执槽做 8 桶轮换
+  （写侧写全部桶，读侧任一通顺桶即可），消除单点粘死。
+
+复现/验证：`torch_ext/tests/repro_p2p_big.py`（48/64/128MB 全双工
+isend/irecv，rank-seeded 字节级校验；`--halfduplex` 半双工对照）。isend/irecv，rank-seeded 字节级校验；`--halfduplex` 半双工对照）。
 2. **CUDA graph 捕获**：隔离复现（裸 CUDAGraph + dist.all_reduce，fused 和
    旧路径、单次/重复 replay）**全部通过**；但在 vllm piecewise 捕获里
    allreduce 首次进入图时 capture invalidated（`joinSendStream` 的跨流

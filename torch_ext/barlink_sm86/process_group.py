@@ -324,12 +324,6 @@ class BarlinkBackend(_C10D.Backend):
                   (send, nbytes, self._zc_p2p_usable(t)))
         # chunk bound: the p2p scratch zone is the TOP quarter of the pool
         # (pool/4 - flag tail; allreduce keeps the bottom half), 1 MiB margin.
-        # NOTE: a single chunk is the largest unit the p2p path handles
-        # reliably on this platform -- multi-chunk full-duplex exchanges hit
-        # an unresolved flag-delivery pathology (~4.4s context death, see
-        # BUILD_AND_TEST.md §10), so the chunk is sized to the whole zone
-        # and large messages ride ONE chunk (slow but correct: BAR write
-        # completion is ack-paced at ~10 MB/s under load).
         chunk = (max(self._pool_mb // 4 - 1, 1)) << 20
         peer = 1 - self.rank()
         if nbytes <= chunk:
@@ -338,15 +332,70 @@ class BarlinkBackend(_C10D.Backend):
             else:
                 bl.recv_into(t, peer)
             return
+        # multi-chunk. Root cause (diagnosed 2026-10-04, dual 3080 +
+        # IOMMU): sustained BIDIRECTIONAL BAR-write floods corrupt the
+        # control channel -- st.global.wt flag/receipt marks are delayed
+        # past the spin timeout or dropped, and even red.global.add counters
+        # end up unreadable/regressed while both GPUs flood each other;
+        # single-direction floods are clean (half-duplex multi-chunk over
+        # red.add counters transfers perfectly, and the single-chunk
+        # full-duplex counter protocol is decode-proven). So big messages
+        # SERIALIZE their floods: isend performs a one-time 16-byte token
+        # exchange through the proven single-chunk protocol (quiet window,
+        # rank 0 first; BOTH ranks call isend under SPMD, so the handshake
+        # happens once per rank -- doing it in irecv too would post extra
+        # receipts and desync the chunk pacing, observed as page-0 tearing:
+        # the stray token-recv's receipt released chunk-1's overwrite gate
+        # while chunk 0's scratch was still being read). The token recv on
+        # each side also paces chunk 0's overwrite of the token's scratch;
+        # later chunks are paced by the protocol's receipt gate.
+        if send:
+            # Big-p2p flow (all control writes cross in QUIET windows --
+            # cross-direction control traffic is unreliable while both GPUs
+            # flood each other on this platform):
+            #  1. per-message readiness handshake (isend-side only, both
+            #     ranks call isend under SPMD): one token send + one token
+            #     recv each, keeping send/recv op ordinals aligned 1:1 (a
+            #     one-sided handshake collides flag ordinals; an irecv-side
+            #     handshake permutes the streams -- both observed as
+            #     deterministic page-0 tearing when a stray receipt
+            #     released a chunk overwrite gate mid-read).
+            #  2. the two messages' payload FLOODS STRICTLY ALTERNATE via a
+            #     turn marker (slot 11): my chunks wait turn >= my_msg - 1
+            #     (rank 0's first message waits nothing), and a done marker
+            #     after my last chunk releases the peer's next turn. This
+            #     is what makes the chunk flags/receipts reliable: they
+            #     never cross an active opposing flood.
+            #  3. chunk overwrite pacing stays on the protocol's receipt
+            #     gate (kernel-boundary receipt), with idempotent re-marks
+            #     covering the rare lost flag/receipt.
+            self._big_msg = getattr(self, "_big_msg", 0) + 1
+            msg = self._big_msg
+            want = msg - 1 if self.rank() == 0 else msg
+            dev = t.device
+            tok_s = torch.zeros(2, dtype=torch.int64, device=dev)   # 16 B
+            tok_r = torch.empty(2, dtype=torch.int64, device=dev)
+            done = torch.zeros(2, dtype=torch.int64, device=dev)
+            if self.rank() == 0:
+                bl.send_into(tok_s, peer)
+                bl.recv_into(tok_r, peer)
+            else:
+                bl.recv_into(tok_r, peer)
+                bl.send_into(tok_s, peer)
+            step = (chunk // 16) * 16   # chunks stay 16-byte aligned
+            fb = t.view(torch.uint8).view(-1)
+            offs = list(range(0, nbytes, step))
+            for j, off in enumerate(offs):
+                c = fb[off:off + step]
+                last = j == len(offs) - 1
+                bl.send_into(c, peer, turn_want=want,
+                             turn_mark=msg if last else 0)
+            return
         step = (chunk // 16) * 16   # chunks stay 16-byte aligned
         fb = t.view(torch.uint8).view(-1)
         for off in range(0, nbytes, step):
             c = fb[off:off + step]
-            # each chunk is its own exchange (own seq + arm handshake)
-            if send:
-                bl.send_into(c, peer)
-            else:
-                bl.recv_into(c, peer)
+            bl.recv_into(c, peer)
 
     def _send_impl(self, t):
         self._dbg("send_impl", tuple(t.shape), t.dtype)
