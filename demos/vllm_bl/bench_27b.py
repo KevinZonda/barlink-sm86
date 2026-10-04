@@ -26,6 +26,9 @@ def main():
     ap.add_argument("--mtp", type=int, default=0,
                     help=">0: enable MTP speculative decoding with N "
                          "speculative tokens (method='mtp')")
+    ap.add_argument("--kv-dtype", type=str, default="",
+                    help="e.g. fp8_e4m3 -> kv_cache_dtype")
+    ap.add_argument("--chunked-prefill", action="store_true")
     a = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -60,6 +63,10 @@ def main():
     if a.mtp > 0:
         llm_kwargs["speculative_config"] = {
             "method": "mtp", "num_speculative_tokens": a.mtp}
+    if a.kv_dtype:
+        llm_kwargs["kv_cache_dtype"] = a.kv_dtype
+    if a.chunked_prefill:
+        llm_kwargs["enable_chunked_prefill"] = True
     llm = LLM(**llm_kwargs)
 
     sp = SamplingParams(temperature=0, max_tokens=a.max_tokens)
