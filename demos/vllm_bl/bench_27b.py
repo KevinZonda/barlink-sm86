@@ -23,6 +23,9 @@ def main():
     ap.add_argument("--warm-repeat", type=int, default=0,
                     help=">0: run the same request N extra times (prefix cache "
                          "hit -> wall is decode-dominated); reports min wall")
+    ap.add_argument("--mtp", type=int, default=0,
+                    help=">0: enable MTP speculative decoding with N "
+                         "speculative tokens (method='mtp')")
     a = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -46,12 +49,18 @@ def main():
         reps = a.prompt_tokens // len(unit.split()) + 1
         PROMPTS = [" ".join((unit * reps).split()[:a.prompt_tokens])]
 
-    llm = LLM(model=MODEL,
-              tensor_parallel_size=2,
-              enforce_eager=os.environ.get("ENFORCE_EAGER") == "1",
-              gpu_memory_utilization=a.gpu_mem,
-              max_model_len=a.max_model_len,
-              max_num_seqs=a.max_num_seqs)
+    llm_kwargs = dict(
+        model=MODEL,
+        tensor_parallel_size=2,
+        enforce_eager=os.environ.get("ENFORCE_EAGER") == "1",
+        gpu_memory_utilization=a.gpu_mem,
+        max_model_len=a.max_model_len,
+        max_num_seqs=a.max_num_seqs,
+    )
+    if a.mtp > 0:
+        llm_kwargs["speculative_config"] = {
+            "method": "mtp", "num_speculative_tokens": a.mtp}
+    llm = LLM(**llm_kwargs)
 
     sp = SamplingParams(temperature=0, max_tokens=a.max_tokens)
     t0 = time.perf_counter()
@@ -89,12 +98,20 @@ def main():
             decode_tps = gen_tokens / warm_wall
             if prefill_s is None:
                 prefill_s = wall - warm_wall
+    # speculative verify counts (acceptance diagnostics, v1 RequestOutput)
+    svc = [getattr(o, "spec_verify_ct", None) for o in outs]
+    svc = [x for x in svc if x]
+    spec = {"mtp": a.mtp, "verify_ct": svc[0] if len(svc) == 1 else svc or None}
+    if svc and gen_tokens:
+        # mean accepted tokens per verify step = gen_tokens / verify_ct
+        spec["mean_accept"] = gen_tokens / svc[0] if len(svc) == 1 else None
     first = outs[0].outputs[0].text[:160].replace("\n", " ")
     print("BENCH RESULT backend_env_shim_off=%s prompts=%d gen_tokens=%d "
-          "wall=%.2fs tps=%.2f decode_tps=%s prefill_s=%s warm_wall=%s" %
+          "wall=%.2fs tps=%.2f decode_tps=%s prefill_s=%s warm_wall=%s "
+          "spec=%s" %
           (os.environ.get("BL_SHIM_OFF"), n_prompts,
            gen_tokens, wall, tps, decode_tps, prefill_s,
-          "%.2f" % warm_wall if warm_wall else None), flush=True)
+           "%.2f" % warm_wall if warm_wall else None, spec), flush=True)
     print("SAMPLE: %s" % first, flush=True)
     tag = "nccl" if os.environ.get("BL_SHIM_OFF") == "1" else "barlink"
     out = a.out_json or ("demos/vllm_bl/bench27b_%s.json" % tag)
@@ -104,6 +121,7 @@ def main():
                    "gen_tokens": gen_tokens,
                    "wall_s": wall, "tps": tps, "decode_tps": decode_tps,
                    "prefill_s": prefill_s, "warm_wall_s": warm_wall,
+                   "spec": spec,
                    "enforce_eager": os.environ.get("ENFORCE_EAGER") == "1",
                    "sample": first}, f, indent=2)
 
