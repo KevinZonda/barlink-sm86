@@ -233,11 +233,15 @@ back-to-back；raw bl 链路 ≤64 KiB 是 22-26 µs；`bench/latency/run_pg_lat
 偏移）+ 本地 add kernel 直写 `out`（scratch 侧 ld.relaxed.sys 读），arm/完成
 flag 协议不变，全程 stream-ordered、无 host sync、无 pool 中转。
 
-**fused 小消息协议**（payload ≤ 64KB，2 个 kernel 替代 6 个；2026-10-04）：
-- consumed-receipt 门控（借 p2p 的教训，不用 arm 握手）：接收侧 fused kernel
-  完成 add 后由本地原子计数器选出的最后一个 block 向发送方 receipt slot
-  回执（BAR wt）；发送侧 fused kernel 每 block 先轮询本地 receipt ≥ seq−1
-  再写 peer scratch——等待链在 op 1 终止，无环
+**fused 小消息协议**（payload ≤ 64KB；2026-10-04，当日升级为 **replay-safe
+设备计数器协议，3 个 kernel**）：CUDA graph 会不经 host 重放捕获的 kernel，
+任何烘焙进 kernel 的 host 序号都会在重放时破坏 flag 单调性（stale flag →
+读到旧 payload / 等待超时 trap —— 这就是 vLLM graph 捕获失败的根因）。
+现协议完全无 host 序号：K0 单线程把两个期望计数器 +1；K1 各 block 轮询
+receipt ≥ 期望−1 后写 payload，末 block（本地原子选举）用
+`red.global.add.u64` 给对端 flag +1；K2 各 block 等 flag ≥ 期望后做
+add，末 block 给对端 receipt +1。远端标记用 BAR 原子（探针证实功能正确），
+发射即忘、无完成延迟暴露。等待链在 op 1 终止。
 - 专用 scratch 分区（allreduce 半区的顶部切片）+ 专用 flag/receipt slot，
   fused 与旧 arm 路径**内存不相交**，混合尺寸序列无需跨协议门控（soak：
   300 次验证 op + 50 对 fused/旧路径交错，逐位一致）
@@ -525,8 +529,15 @@ W8A16 直接加载）。`--enforce-eager`（graph 捕获仍受阻，见上）：
 
 | backend | tok/s（batch 4 × 256 tok） | wall |
 |---|---|---|
-| barlink PG | **62.7 / 61.8**（均值 ~62.2） | 16.3–16.6 s |
-| NCCL（SHM 中转） | **65.4 / 64.5**（均值 ~64.9） | 15.7–15.9 s |
+| barlink PG（enforce-eager） | 62.7 / 61.8（均值 ~62.2） | 16.3–16.6 s |
+| NCCL（eager） | 65.4 / 64.5（均值 ~64.9） | 15.7–15.9 s |
+| **barlink PG（CUDA graph）** | **150.0 / 149.9** | 6.8 s |
+| NCCL（CUDA graph） | 143.9 / 144.6（均值 ~144.2） | 7.1 s |
+
+graph 模式（FULL_AND_PIECEWISE，replay-safe 协议后不再需要
+--enforce-eager）：barlink 比 eager 快 **2.4×**，且反超 NCCL **~4%** ——
+eager 的每 op Python→c10d→PG 派发开销消失后，fused 协议的链路延迟优势
+显现。
 
 - 两 backend greedy 输出逐字一致（同一 int8 kernel + 等价加法语义）。
 - NCCL 快 ~4%：enforce-eager 下每 op 走 Python→c10d→PG 派发，barlink 的

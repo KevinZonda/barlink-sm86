@@ -2262,30 +2262,71 @@ __device__ __forceinline__ static __half blElemAdd(__half a, __half b);
 #define BL_AR_FLAG_SLOT   5            // my pool: payload-complete flag from the peer (+0)
 #define BL_AR_CNT_SLOT    7            // local last-block election counters (+0 send, +8 recv)
 
-// fused producer: wait receipt >= seq-1, payload -> peer fused zone, then
-// (last block) raise the peer's flag.
+// --- replay-safe fused protocol (device counters, 3 kernels) ---------------
+// The captured CUDA graphs REPLAY these kernels without host involvement, so
+// NO host-passed seq may be baked in: every kernel execution advances LOCAL
+// device counters by exactly one and waits compare counter VALUES read from
+// memory. Remote marks use red.global.add.u64 (proven functional on the peer
+// BAR1 window by bl_probe_bar_atomic; fire-and-forget like a posted write, so
+// no completion-latency exposure). Slot 5 layout (per pool): +0 completion
+// marks from the peer (remote), +8 receipts from the peer (remote), +16 my
+// flag expectation (local), +24 my receipt expectation (local).
+//
+// Chain per op k: K0 bumps both expectations to k (one thread, stream-
+// ordered before every read). K1 (sender): all blocks gate on receipt >=
+// receiptExp-1 (peer consumed my previous payload), copy the payload, and
+// the last block (local atomic election) red.adds the peer's flag. K2
+// (receiver): all blocks wait flag >= flagExp, add scratch into out, and the
+// last block red.adds the peer's receipt. Deadlock chain terminates at op 1
+// (gate is vacuous); replay advances every counter once per execution.
+
+__device__ __forceinline__ static void redadd64(void *p, unsigned long long v)
+{
+    asm volatile("red.global.add.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+
+__device__ __forceinline__ static unsigned long long ldseq(
+    const unsigned long long *p)
+{
+    unsigned long long v;
+    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+                 : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ static void spin_until(
+    const unsigned long long *flag, unsigned long long want)
+{
+    const long long t0 = clock64();
+    while (ldseq(flag) < want) {
+        if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
+    }
+}
+
+// K0: bump both expectation counters once per op
+__global__ void k_fused_bump(unsigned long long *flagExp,
+                             unsigned long long *receiptExp)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        unsigned long long one = 1;
+        asm volatile("red.global.add.u64 [%0], %1;"
+                     :: "l"(flagExp), "l"(one) : "memory");
+        asm volatile("red.global.add.u64 [%0], %1;"
+                     :: "l"(receiptExp), "l"(one) : "memory");
+    }
+}
+
+// K1: gate on the peer's previous receipt, payload -> peer fused zone, last
+// block raises the peer's completion flag
 __global__ void k_fused_send(const uint4 *__restrict__ in,
                              uint4 *__restrict__ peerScr,
                              const unsigned long long *__restrict__ receipt,
+                             const unsigned long long *__restrict__ receiptExp,
                              unsigned long long *__restrict__ flagBar,
                              unsigned long long *__restrict__ counter,
-                             unsigned long long seq, size_t n4)
+                             size_t n4)
 {
-    // receipt gate: peer must have consumed the previous fused payload.
-    // seq == 1 (first fused op ever) finds the zero-initialized slot >= 0.
-    if (seq > 1) {
-        const long long t0 = clock64();
-        unsigned ns = 32;
-        for (;;) {
-            unsigned long long v;
-            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
-                         : "=l"(v) : "l"(receipt) : "memory");
-            if (v >= seq - 1) break;
-            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
-            __nanosleep(ns);
-            if (ns < (1u << 20)) ns <<= 1;
-        }
-    }
+    spin_until(receipt, ldseq(receiptExp) - 1);
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride)
@@ -2298,37 +2339,25 @@ __global__ void k_fused_send(const uint4 *__restrict__ in,
                      : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
         isLast = (old == (unsigned long long)gridDim.x - 1);
         if (isLast) {
-            stwt64(flagBar, seq);
+            redadd64(flagBar, 1);
             *counter = 0;   // next op's kernel starts after this one completes
         }
     }
     __syncthreads();
 }
 
-// fused consumer: wait flag >= seq, out = in + scratch (ld.relaxed.sys),
-// then (last block) post the receipt to the peer.
+// K2: wait the peer's flag, out = in + scratch, last block posts the receipt
 template <typename T>
 __global__ void k_fused_recv_t(uint4 *__restrict__ out,
                                const uint4 *__restrict__ in,
                                const uint4 *__restrict__ scr,
                                const unsigned long long *__restrict__ flag,
+                               const unsigned long long *__restrict__ flagExp,
                                unsigned long long *__restrict__ receiptBar,
                                unsigned long long *__restrict__ counter,
-                               unsigned long long seq, size_t n4)
+                               size_t n4)
 {
-    {
-        const long long t0 = clock64();
-        unsigned ns = 32;
-        for (;;) {
-            unsigned long long v;
-            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
-                         : "=l"(v) : "l"(flag) : "memory");
-            if (v >= seq) break;
-            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
-            __nanosleep(ns);
-            if (ns < (1u << 20)) ns <<= 1;
-        }
-    }
+    spin_until(flag, ldseq(flagExp));
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride) {
@@ -2351,37 +2380,24 @@ __global__ void k_fused_recv_t(uint4 *__restrict__ out,
                      : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
         isLast = (old == (unsigned long long)gridDim.x - 1);
         if (isLast) {
-            stwt64(receiptBar, seq);
+            redadd64(receiptBar, 1);
             *counter = 0;
         }
     }
     __syncthreads();
 }
 
-// fp8 variant on raw storage (same by-value miscompile workaround as the
-// other fp8 kernels).
 template <__nv_fp8_interpretation_t INTERP>
 __global__ void k_fused_recv_fp8(uint4 *__restrict__ out,
                                  const uint4 *__restrict__ in,
                                  const uint4 *__restrict__ scr,
                                  const unsigned long long *__restrict__ flag,
+                                 const unsigned long long *__restrict__ flagExp,
                                  unsigned long long *__restrict__ receiptBar,
                                  unsigned long long *__restrict__ counter,
-                                 unsigned long long seq, size_t n4)
+                                 size_t n4)
 {
-    {
-        const long long t0 = clock64();
-        unsigned ns = 32;
-        for (;;) {
-            unsigned long long v;
-            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
-                         : "=l"(v) : "l"(flag) : "memory");
-            if (v >= seq) break;
-            if (clock64() - t0 > 200LL * 1000 * 1000 * 1000) __trap();
-            __nanosleep(ns);
-            if (ns < (1u << 20)) ns <<= 1;
-        }
-    }
+    spin_until(flag, ldseq(flagExp));
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += stride) {
@@ -2412,36 +2428,34 @@ __global__ void k_fused_recv_fp8(uint4 *__restrict__ out,
                      : "=l"(old) : "l"(counter), "l"(1ULL) : "memory");
         isLast = (old == (unsigned long long)gridDim.x - 1);
         if (isLast) {
-            stwt64(receiptBar, seq);
+            redadd64(receiptBar, 1);
             *counter = 0;
         }
     }
     __syncthreads();
 }
 
-// local-atomic counters for the last-block election (own pool, flag tail
-// scratch area inside the fused zone metadata -- kept in unused flag slots)
 static int launchFusedRecv(int dtype, uint4 *out, const uint4 *in,
                            const uint4 *scr,
                            const unsigned long long *flag,
+                           const unsigned long long *flagExp,
                            unsigned long long *receiptBar,
                            unsigned long long *counter,
-                           unsigned long long seq, size_t n4,
-                           size_t blocks, cudaStream_t stream)
+                           size_t n4, size_t blocks, cudaStream_t stream)
 {
     switch (dtype) {
     case BL_DTYPE_FP16:    k_fused_recv_t<__half><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     case BL_DTYPE_FP32:    k_fused_recv_t<float><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     case BL_DTYPE_FP64:    k_fused_recv_t<double><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     case BL_DTYPE_BF16:    k_fused_recv_t<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     case BL_DTYPE_FP8E4M3: k_fused_recv_fp8<__NV_E4M3><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     case BL_DTYPE_FP8E5M2: k_fused_recv_fp8<__NV_E5M2><<<blocks, 256, 0, stream>>>(
-        out, in, scr, flag, receiptBar, counter, seq, n4); break;
+        out, in, scr, flag, flagExp, receiptBar, counter, n4); break;
     default: return -1;
     }
     return 0;
@@ -2893,23 +2907,22 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
     cudaStream_t s = (cudaStream_t)stream;
     joinSendStream(ctx, s);
 
-    // fused small-message path: 2 stream-ordered kernels instead of 6
-    // (consumed-receipt gating + last-block flag/receipt election). Own
-    // scratch slice (top of the ar half) and own receipt/flag slots, so
-    // mixed fused/old sequences need no cross-protocol gating. See the
-    // kernel notes above bl_allreduce_into_peer.
-    if (bytes <= BL_FUSED_MAX) {
-        uint64_t fseq;
-        {
-            std::lock_guard<std::mutex> lk(ctx->seqMu);
-            fseq = ++ctx->fusedSeq;
-        }
+    // fused small-message path: 3 stream-ordered kernels, replay-safe
+    // device-counter protocol (CUDA graphs replay these kernels without
+    // host involvement -- no host seq may be baked in). Own scratch slice
+    // (top of the ar half) and own slot family, so mixed fused/old
+    // sequences need no cross-protocol gating. See the kernel notes above.
+    if (bytes <= BL_FUSED_MAX && !std::getenv("BL_AR_NO_FUSED")) {
         const size_t fn4 = n4;
         const size_t fblocks = gridBlocks(fn4, myOrd);
+        unsigned long long *myFlag = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT));          // +0 remote
         unsigned long long *myReceipt = (unsigned long long *)(uintptr_t)(
-            myP.dptr + flagOff(myP, BL_AR_RECV_SLOT));
-        unsigned long long *myFlagL = (unsigned long long *)(uintptr_t)(
-            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT));
+            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT) + 8);      // +8 remote
+        unsigned long long *myFlagExp = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT) + 16);     // +16 local
+        unsigned long long *myReceiptExp = (unsigned long long *)(uintptr_t)(
+            myP.dptr + flagOff(myP, BL_AR_FLAG_SLOT) + 24);     // +24 local
         unsigned long long *sendCnt = (unsigned long long *)(uintptr_t)(
             myP.dptr + flagOff(myP, BL_AR_CNT_SLOT));
         unsigned long long *recvCnt = (unsigned long long *)(uintptr_t)(
@@ -2917,17 +2930,17 @@ extern "C" int bl_allreduce_into_peer(blCtx *ctx, const void *inPtr,
         unsigned long long *peerFlagBar = (unsigned long long *)((uint8_t *)bar +
             flagOff(ctx->pools[peer], BL_AR_FLAG_SLOT));
         unsigned long long *peerReceiptBar = (unsigned long long *)((uint8_t *)bar +
-            flagOff(ctx->pools[peer], BL_AR_RECV_SLOT));
+            flagOff(ctx->pools[peer], BL_AR_FLAG_SLOT) + 8);
+        k_fused_bump<<<1, 1, 0, s>>>(myFlagExp, myReceiptExp);
         k_fused_send<<<fblocks, 256, 0, s>>>(
             (const uint4 *)inPtr, (uint4 *)((uint8_t *)bar + ctx->fusedZoneBase),
-            myReceipt, peerFlagBar, sendCnt, fseq, fn4);
+            myReceipt, myReceiptExp, peerFlagBar, sendCnt, fn4);
         BL_CAPDBG("fused-send");
-        BL_CAPDBG("fused-recv-pre");
         if (launchFusedRecv(dtype, (uint4 *)outPtr, (const uint4 *)inPtr,
                             (const uint4 *)(uintptr_t)(
                                 myP.dptr + ctx->fusedZoneBase),
-                            myFlagL, peerReceiptBar, recvCnt,
-                            fseq, fn4, fblocks, s) != 0) {
+                            myFlag, myFlagExp, peerReceiptBar, recvCnt,
+                            fn4, fblocks, s) != 0) {
             setErr(err, errlen,
                    "bl_allreduce_into_peer: fused path bad dtype (internal)");
             return -1;

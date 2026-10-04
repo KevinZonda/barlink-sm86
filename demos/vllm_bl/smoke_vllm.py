@@ -7,7 +7,8 @@ llm = LLM(model="/mnt/modelzoo/Qwen/Qwen2-1.5B",
           tensor_parallel_size=2,
           enforce_eager=enforce,
           gpu_memory_utilization=0.42,
-          max_model_len=512)
+          max_model_len=512,
+          compilation_config={"cudagraph_mode": "PIECEWISE"})
 out = llm.generate(["Hello, my name is"],
                    SamplingParams(max_tokens=32, temperature=0))
 print("SMOKE OUTPUT: %r" % out[0].outputs[0].text, flush=True)

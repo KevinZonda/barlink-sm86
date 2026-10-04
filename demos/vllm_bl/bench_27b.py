@@ -34,7 +34,7 @@ def main():
 
     llm = LLM(model=MODEL,
               tensor_parallel_size=2,
-              enforce_eager=True,
+              enforce_eager=os.environ.get("ENFORCE_EAGER") == "1",
               gpu_memory_utilization=a.gpu_mem,
               max_model_len=a.max_model_len,
               max_num_seqs=a.max_num_seqs)
@@ -56,7 +56,7 @@ def main():
     with open("demos/vllm_bl/bench27b_%s.json" % tag, "w") as f:
         json.dump({"backend": tag, "shim_off": os.environ.get("BL_SHIM_OFF"),
                    "prompts": n_prompts, "gen_tokens": gen_tokens,
-                   "wall_s": wall, "tps": tps, "enforce_eager": True,
+                   "wall_s": wall, "tps": tps, "enforce_eager": os.environ.get("ENFORCE_EAGER") == "1",
                    "sample": first}, f, indent=2)
 
 

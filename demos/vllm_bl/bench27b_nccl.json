@@ -3,8 +3,8 @@
   "shim_off": "1",
   "prompts": 4,
   "gen_tokens": 1024,
-  "wall_s": 15.879894712998066,
-  "tps": 64.48405474387887,
-  "enforce_eager": true,
-  "sample": "  This is a deep-dive into the mechanics of Peer-to-Peer (P2P) Direct Memory Access (DMA) over a GPU's Base Address Register (BAR) 1 aperture. This mechanism is"
+  "wall_s": 7.081878695011255,
+  "tps": 144.59439989015127,
+  "enforce_eager": false,
+  "sample": "  This is a deep-dive into the mechanics of Peer-to-Peer (P2P) Direct Memory Access (DMA) over a GPU's Base Address Register (BAR) 1 aperture.  To understand th"
 }

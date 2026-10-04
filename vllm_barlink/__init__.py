@@ -17,6 +17,12 @@
 
 import os
 
+if os.environ.get("BL_SHIM_DEBUG") == "1":
+    import sys as _sd
+    _sd.stderr.write("[shim] loaded pid=%d BL_CAPDBG=%r BL_PG_DEBUG=%r\n"
+                     % (os.getpid(), os.environ.get("BL_CAPDBG"),
+                        os.environ.get("BL_PG_DEBUG")))
+
 _DONE = False
 
 
@@ -106,6 +112,31 @@ def install():
             import sys as _s
             _s.stderr.write(
                 "vllm_barlink: CudaCommunicator patch skipped: %s\n" % e)
+
+    if _step(5):
+        # CUDA-graph capture: the barlink PG's collectives are NOT
+        # capture-safe inside vllm's piecewise compiled graphs (capture
+        # invalidation / launch failure -- root cause tracked in
+        # BUILD_AND_TEST.md section 10; isolated breakable-capture repros
+        # pass, so it is specific to the inductor piecewise path). Force
+        # vllm::all_reduce to be a SPLITTING op so it runs eagerly between
+        # graph pieces instead of being captured.
+        try:
+            from vllm.config.compilation import CompilationConfig
+            _orig_sso = CompilationConfig.set_splitting_ops_for_v1
+
+            def set_splitting_ops_for_v1(self, *a, **k):
+                _orig_sso(self, *a, **k)
+                if getattr(self, "splitting_ops", None) and \
+                        "vllm::all_reduce" not in self.splitting_ops:
+                    self.splitting_ops.append("vllm::all_reduce")
+
+            CompilationConfig.set_splitting_ops_for_v1 = \
+                set_splitting_ops_for_v1
+        except Exception as e:
+            import sys as _s
+            _s.stderr.write(
+                "vllm_barlink: splitting-ops patch skipped: %s\n" % e)
 
 
 install()
