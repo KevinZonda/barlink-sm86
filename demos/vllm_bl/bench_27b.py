@@ -33,7 +33,7 @@ def main():
 
     from vllm import LLM, SamplingParams
 
-    MODEL = "/mnt/modelzoo/lued/Qwen3.8-27B-INT8-W8A16-MTP"
+    MODEL = os.environ.get("BENCH_MODEL", "/mnt/modelzoo/lued/Qwen3.8-27B-INT8-W8A16-MTP")
     PROMPTS = [
         "Explain how PCIe peer-to-peer DMA over a GPU BAR1 aperture works, in "
         "technical detail, covering TLP routing and IOMMU translation.",
